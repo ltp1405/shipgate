@@ -82,6 +82,32 @@ impl App {
         self.questions.get(self.current)
     }
 
+    /// Index of the first question still worth answering, so quitting and
+    /// resuming picks up where you stopped instead of re-grading work that
+    /// already passed — each of which would cost another judge call.
+    pub fn first_unanswered(questions: &[db::Question]) -> usize {
+        questions
+            .iter()
+            .position(|q| q.status != "passed")
+            .unwrap_or(0)
+    }
+
+    /// Scores carried over from previous runs.
+    pub fn restored_scores(questions: &[db::Question]) -> Vec<f64> {
+        questions.iter().map(|q| q.score.unwrap_or(0.0)).collect()
+    }
+
+    /// The next question that still needs an answer. `None` when the quiz is
+    /// done.
+    fn next_unanswered(&self) -> Option<usize> {
+        self.questions
+            .iter()
+            .enumerate()
+            .skip(self.current + 1)
+            .find(|(_, q)| q.status != "passed")
+            .map(|(i, _)| i)
+    }
+
     /// Scroll the diff to the hunk this question is about, so the reader does
     /// not have to hunt for it.
     ///
@@ -285,15 +311,14 @@ pub fn run(
     ai_hunks: &[git::Hunk],
     questions: Vec<db::Question>,
 ) -> Result<Vec<f64>> {
-    let total = questions.len();
     let mut app = App {
+        current: App::first_unanswered(&questions),
+        scores: App::restored_scores(&questions),
         questions,
-        current: 0,
         answer: String::new(),
         mode: Mode::Answering,
         hints_shown: 0,
         verdict: None,
-        scores: vec![0.0; total],
         diff: build_diff_view(&diff, ai_hunks),
         scroll: 0,
         hscroll: 0,
@@ -421,12 +446,13 @@ fn event_loop(
             // Back to the hunk this question is about, after wandering off.
             (KeyCode::Char('g'), _) => app.jump_to_anchor(ai_hunks),
 
-            // Next question.
+            // Next question. Already-passed ones are skipped, since re-grading
+            // them costs a judge call and changes nothing.
             (KeyCode::Char(' '), true) => {
-                if app.current + 1 >= app.questions.len() {
+                let Some(next) = app.next_unanswered() else {
                     return Ok(());
-                }
-                app.current += 1;
+                };
+                app.current = next;
                 app.answer.clear();
                 app.hints_shown = 0;
                 app.verdict = None;
@@ -1074,5 +1100,92 @@ diff --git a/b.rs b/b.rs
         app.hscroll = 40;
         app.jump_to_anchor(&hunks);
         assert_eq!(app.hscroll, 0);
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    fn q(id: i64, status: &str, score: Option<f64>) -> db::Question {
+        db::Question {
+            id,
+            kind: "prediction".into(),
+            file: "a.rs".into(),
+            anchor: "sha256:x".into(),
+            text: "q".into(),
+            reference: "r".into(),
+            hints: vec![],
+            status: status.into(),
+            label: None,
+            score,
+        }
+    }
+
+    #[test]
+    fn resuming_starts_at_the_first_unanswered_question() {
+        let qs = vec![
+            q(1, "passed", Some(0.9)),
+            q(2, "passed", Some(0.6)),
+            q(3, "open", None),
+        ];
+        assert_eq!(App::first_unanswered(&qs), 2);
+    }
+
+    #[test]
+    fn a_fresh_gate_starts_at_the_beginning() {
+        let qs = vec![q(1, "open", None), q(2, "open", None)];
+        assert_eq!(App::first_unanswered(&qs), 0);
+    }
+
+    /// Every question passed: there is nothing to ask, and the restored scores
+    /// alone must satisfy the pass rule.
+    #[test]
+    fn a_fully_answered_gate_clears_without_asking_again() {
+        let qs = vec![q(1, "passed", Some(0.9)), q(2, "passed", Some(0.6))];
+        let scores = App::restored_scores(&qs);
+        assert_eq!(scores, vec![0.9, 0.6]);
+        assert!(crate::gate::passes(&scores));
+    }
+
+    #[test]
+    fn scores_carry_over_and_unanswered_ones_start_at_zero() {
+        let qs = vec![q(1, "passed", Some(0.9)), q(2, "open", None)];
+        assert_eq!(App::restored_scores(&qs), vec![0.9, 0.0]);
+    }
+
+    /// A question that was answered but failed is not "done" — it must be
+    /// offered again, or the gate can never clear.
+    #[test]
+    fn a_failed_question_is_offered_again() {
+        let qs = vec![q(1, "open", Some(0.3)), q(2, "open", None)];
+        assert_eq!(App::first_unanswered(&qs), 0);
+        assert_eq!(App::restored_scores(&qs), vec![0.3, 0.0]);
+    }
+
+    #[test]
+    fn advancing_skips_questions_that_already_passed() {
+        let mut app = App {
+            questions: vec![
+                q(1, "open", None),
+                q(2, "passed", Some(0.9)),
+                q(3, "open", None),
+            ],
+            current: 0,
+            answer: String::new(),
+            mode: Mode::Answering,
+            hints_shown: 0,
+            verdict: None,
+            scores: vec![0.0; 3],
+            diff: vec![],
+            scroll: 0,
+            hscroll: 0,
+            viewport: std::cell::Cell::new(10),
+            status: String::new(),
+            quit: false,
+        };
+        assert_eq!(app.next_unanswered(), Some(2), "should skip the passed one");
+        app.current = 2;
+        assert_eq!(app.next_unanswered(), None, "nothing left to ask");
     }
 }

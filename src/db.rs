@@ -400,6 +400,18 @@ pub fn gates_for_repo(conn: &Connection, repo: &str) -> Result<Vec<Gate>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// How much graded work a gate is holding. Regenerating destroys it, since
+/// questions cascade from the gate and attempts from the questions.
+pub fn attempt_count(conn: &Connection, gate_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM attempts a
+         JOIN questions q ON q.id = a.question_id
+         WHERE q.gate_id = ?1",
+        params![gate_id],
+        |r| r.get(0),
+    )?)
+}
+
 pub struct Obligation {
     pub pr_number: u64,
     pub body: String,

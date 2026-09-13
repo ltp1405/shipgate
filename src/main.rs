@@ -34,6 +34,10 @@ enum Command {
         /// Use offline stand-ins instead of the model. No cost, no network.
         #[arg(long)]
         offline: bool,
+        /// Generate new questions even though the stored gate holds graded
+        /// answers, discarding them.
+        #[arg(long)]
+        force: bool,
     },
     /// PRs that went ready without a gate, plus open obligations.
     Status,
@@ -43,8 +47,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir()?;
     match cli.command {
-        Command::Ready { dry_run, reuse, offline } => {
-            gate::Ready { dry_run, reuse, offline }.run(&cwd)
+        Command::Ready { dry_run, reuse, offline, force } => {
+            gate::Ready { dry_run, reuse, offline, force }.run(&cwd)
         }
         Command::Status => gate::status(&cwd),
     }

@@ -61,6 +61,8 @@ pub struct Ready {
     pub dry_run: bool,
     /// Use the offline stand-ins instead of the model. No cost, no network.
     pub offline: bool,
+    /// Regenerate even though the stored gate holds graded answers.
+    pub force: bool,
     /// Replay the stored gate instead of generating. Generation is the
     /// expensive half, so without this every look at the quiz costs a model
     /// call.
@@ -92,9 +94,28 @@ impl Ready {
 
         // Replaying uses the stored snapshot, so none of the HEAD-derived work
         // below applies.
+        let conn = db::open()?;
         if self.reuse {
-            let conn = db::open()?;
             return self.replay(&conn, &dir, &pr, &repo, &branch, &base_ref);
+        }
+
+        // Refuse to throw away graded work. Questions cascade from the gate and
+        // attempts from the questions, so regenerating deletes every answer you
+        // have already been graded on. Checked before generating, so the refusal
+        // costs nothing.
+        if !self.force {
+            if let Some(existing) = db::gate_for_pr(&conn, &repo, pr.number)? {
+                let answered = db::attempt_count(&conn, existing.id)?;
+                if answered > 0 {
+                    bail!(
+                        "{repo}#{} already has {answered} graded answer{} — regenerating would \
+                         delete them.\n  --reuse   continue with the stored questions\n  \
+                         --force   discard them and generate new ones",
+                        pr.number,
+                        if answered == 1 { "" } else { "s" }
+                    );
+                }
+            }
         }
 
         let head_sha = git::rev_parse(&dir, "HEAD")?;
@@ -330,6 +351,11 @@ impl Ready {
         ai_hunks: &[git::Hunk],
         questions: Vec<db::Question>,
     ) -> Result<Vec<f64>> {
+        let done = questions.iter().filter(|q| q.status == "passed").count();
+        if done > 0 {
+            println!("{done} of {} already passed — resuming.", questions.len());
+        }
+
         let judge: Arc<dyn llm::Judge + Send + Sync> = match self.backend() {
             Some(cli) => Arc::new(llm::judge::CliJudge { cli, diff: diff.to_string() }),
             None => Arc::new(llm::stub::StubJudge::default()),
@@ -345,11 +371,14 @@ impl Ready {
                 questions,
             )
         } else {
-            let mut scores = Vec::new();
+            let mut scores = tui::App::restored_scores(&questions);
             for (i, q) in questions.iter().enumerate() {
-                scores.push(self.ask(
+                if q.status == "passed" {
+                    continue;
+                }
+                scores[i] = self.ask(
                     conn, judge.as_ref(), diff, ai_hunks, q, i + 1, questions.len(),
-                )?);
+                )?;
             }
             Ok(scores)
         }
