@@ -1,12 +1,11 @@
 //! §7 — questions from the AI-authored hunks plus repo context.
 
-use super::{anthropic, Context, Generated, Generator};
-use anyhow::Result;
+use super::{cli, Context, Generated, Generator};
+use anyhow::{Context as _, Result};
 use serde::Deserialize;
-use serde_json::json;
 
-pub struct ApiGenerator {
-    pub client: anthropic::Client,
+pub struct CliGenerator {
+    pub cli: cli::Cli,
 }
 
 const SYSTEM: &str = "\
@@ -56,36 +55,22 @@ struct Question {
     hints: Vec<String>,
 }
 
-fn schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "skip": {"type": "boolean"},
-            "reason": {"type": "string"},
-            "questions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string", "enum": [
-                            "checkable", "prediction", "adversarial",
-                            "cross_cutting", "justification"
-                        ]},
-                        "file": {"type": "string"},
-                        "anchor": {"type": "string"},
-                        "text": {"type": "string"},
-                        "reference": {"type": "string"},
-                        "hints": {"type": "array", "items": {"type": "string"}}
-                    },
-                    "required": ["kind", "file", "anchor", "text", "reference", "hints"],
-                    "additionalProperties": false
-                }
-            }
-        },
-        "required": ["skip", "reason", "questions"],
-        "additionalProperties": false
-    })
-}
+/// The CLI cannot enforce a schema, so the shape is stated in the prompt and
+/// validated on the way back in.
+const SHAPE: &str = r#"{
+  "skip": false,
+  "reason": "",
+  "questions": [
+    {
+      "kind": "checkable | prediction | adversarial | cross_cutting | justification",
+      "file": "path/to/file",
+      "anchor": "the anchor string copied verbatim from the hunk",
+      "text": "the question",
+      "reference": "the reference answer",
+      "hints": ["a nudge", "a pointer to specific lines", "half the answer"]
+    }
+  ]
+}"#;
 
 pub fn render_hunks(ctx: &Context) -> String {
     let mut s = String::new();
@@ -95,7 +80,7 @@ pub fn render_hunks(ctx: &Context) -> String {
     s
 }
 
-impl Generator for ApiGenerator {
+impl Generator for CliGenerator {
     fn generate(&self, ctx: &Context) -> Result<Option<Vec<Generated>>> {
         let mut user = String::from("# AI-authored hunks\n\n");
         user.push_str(&render_hunks(ctx));
@@ -118,19 +103,14 @@ impl Generator for ApiGenerator {
             user.push_str(&format!("# Call sites\n\n{}\n", ctx.call_sites.join("\n")));
         }
 
-        let (value, usage) = self.client.complete(
-            anthropic::GENERATE_MODEL,
-            SYSTEM,
-            &user,
-            schema(),
-            "high",
-        )?;
-        let out: Output = serde_json::from_value(value)?;
+        let system = format!("{SYSTEM}\n\n# Reply with exactly this shape\n\n{SHAPE}");
+        let (value, cost) = self
+            .cli
+            .complete_json(cli::GENERATE_MODEL, &system, &user)?;
+        let out: Output = serde_json::from_value(value)
+            .context("the reply did not match the expected shape")?;
 
-        eprintln!(
-            "  generate: {} in ({} cached) / {} out",
-            usage.input_tokens, usage.cache_read_input_tokens, usage.output_tokens
-        );
+        eprintln!("  generate: ${cost:.4}");
 
         if out.skip || out.questions.is_empty() {
             let reason = if out.reason.is_empty() { "nothing worth asking".into() } else { out.reason };
@@ -164,9 +144,4 @@ impl Generator for ApiGenerator {
 
         Ok(Some(questions))
     }
-}
-
-#[cfg(test)]
-pub fn schema_for_test() -> serde_json::Value {
-    schema()
 }

@@ -1,12 +1,11 @@
 //! §8 — grading. The reference answer is deliberately absent from this context.
 
-use super::{anthropic, Judge, Label, Verdict};
+use super::{cli, Judge, Label, Verdict};
 use anyhow::Result;
 use serde::Deserialize;
-use serde_json::json;
 
-pub struct ApiJudge {
-    pub client: anthropic::Client,
+pub struct CliJudge {
+    pub cli: cli::Cli,
     pub diff: String,
 }
 
@@ -68,35 +67,22 @@ pub struct Disputed {
     pub feedback: String,
 }
 
+/// Stated in the prompt rather than enforced — the CLI has no schema support.
 /// Field order matters: the model writes its own answer and its reasoning before
 /// it commits to a label.
-fn answer_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "own_answer": {"type": "string"},
-            "justification": {"type": "string"},
-            "label": {"type": "string", "enum": ["wrong", "restates", "partial", "demonstrates"]},
-            "feedback": {"type": "string"}
-        },
-        "required": ["own_answer", "justification", "label", "feedback"],
-        "additionalProperties": false
-    })
-}
+const ANSWER_SHAPE: &str = r#"{
+  "own_answer": "your own answer to the question, written from the diff",
+  "justification": "why the reviewer's answer earns its label",
+  "label": "wrong | restates | partial | demonstrates",
+  "feedback": "one or two sentences for the reviewer"
+}"#;
 
-fn dispute_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "reasoning": {"type": "string"},
-            "upheld": {"type": "boolean"},
-            "kind": {"type": "string", "enum": ["premise", "reference", "code_bug"]},
-            "feedback": {"type": "string"}
-        },
-        "required": ["reasoning", "upheld", "kind", "feedback"],
-        "additionalProperties": false
-    })
-}
+const DISPUTE_SHAPE: &str = r#"{
+  "reasoning": "the concrete failing input, or the line that contradicts the premise",
+  "upheld": false,
+  "kind": "premise | reference | code_bug",
+  "feedback": "one or two sentences for the reviewer"
+}"#;
 
 fn parse_label(s: &str) -> Label {
     match s {
@@ -107,46 +93,40 @@ fn parse_label(s: &str) -> Label {
     }
 }
 
-impl ApiJudge {
-    fn grade_once(&self, question: &str, answer: &str, effort: &str) -> Result<Graded> {
-        let system = format!("{SYSTEM}\n\n# The diff\n\n{}", self.diff);
+impl CliJudge {
+    fn grade_once(&self, question: &str, answer: &str) -> Result<Graded> {
+        let system = format!(
+            "{SYSTEM}\n\n# Reply with exactly this shape\n\n{ANSWER_SHAPE}\n\n# The diff\n\n{}",
+            self.diff
+        );
         let user = format!("# Question\n\n{question}\n\n# The reviewer's answer\n\n{answer}");
-        let (value, _) = self.client.complete(
-            anthropic::JUDGE_MODEL,
-            &system,
-            &user,
-            answer_schema(),
-            effort,
-        )?;
+        let (value, _) = self.cli.complete_json(cli::JUDGE_MODEL, &system, &user)?;
         Ok(serde_json::from_value(value)?)
     }
 
     pub fn dispute(&self, question: &str, reference: &str, claim: &str) -> Result<Disputed> {
-        let system = format!("{DISPUTE_SYSTEM}\n\n# The diff\n\n{}", self.diff);
+        let system = format!(
+            "{DISPUTE_SYSTEM}\n\n# Reply with exactly this shape\n\n{DISPUTE_SHAPE}\n\n# The diff\n\n{}",
+            self.diff
+        );
         let user = format!(
             "# Question\n\n{question}\n\n# Stored reference answer\n\n{reference}\n\n\
              # The reviewer's claim\n\n{claim}"
         );
-        let (value, _) = self.client.complete(
-            anthropic::JUDGE_MODEL,
-            &system,
-            &user,
-            dispute_schema(),
-            "high",
-        )?;
+        let (value, _) = self.cli.complete_json(cli::JUDGE_MODEL, &system, &user)?;
         Ok(serde_json::from_value(value)?)
     }
 }
 
-impl Judge for ApiJudge {
+impl Judge for CliJudge {
     fn judge(&self, _diff: &str, question: &str, answer: &str) -> Result<Verdict> {
-        let first = self.grade_once(question, answer, "high")?;
+        let first = self.grade_once(question, answer)?;
         let label = parse_label(&first.label);
 
         // Borderline re-judge. `partial` is the label that decides a pass under
-        // the drop-lowest rule, so it is the one worth spending on. Sampling
-        // parameters are rejected on these models, so the re-runs are plain
-        // repeats and the median is over natural variance.
+        // the drop-lowest rule, so it is the one worth spending on. There is no
+        // temperature control here, so the re-runs are plain repeats and the
+        // median is taken over the model's natural variance.
         if label != Label::Partial {
             return Ok(Verdict { label, feedback: first.feedback });
         }
@@ -154,7 +134,7 @@ impl Judge for ApiJudge {
         let mut labels = vec![Label::Partial];
         let mut feedback = first.feedback;
         for _ in 0..2 {
-            match self.grade_once(question, answer, "high") {
+            match self.grade_once(question, answer) {
                 Ok(g) => {
                     let l = parse_label(&g.label);
                     if l != Label::Partial {
@@ -172,11 +152,6 @@ impl Judge for ApiJudge {
     }
 
     fn model(&self) -> &str {
-        anthropic::JUDGE_MODEL
+        cli::JUDGE_MODEL
     }
-}
-
-#[cfg(test)]
-pub fn schemas_for_test() -> Vec<(&'static str, serde_json::Value)> {
-    vec![("judge.answer", answer_schema()), ("judge.dispute", dispute_schema())]
 }

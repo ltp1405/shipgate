@@ -167,13 +167,13 @@ impl Ready {
             eprintln!("note: no test command found — no checkable question is possible");
         }
 
-        let generator: Box<dyn llm::Generator> = match llm::anthropic::Client::from_env()? {
-            Some(client) => {
+        let generator: Box<dyn llm::Generator> = match llm::cli::Cli::detect() {
+            Some(cli) => {
                 println!("Generating questions…");
-                Box::new(llm::generate::ApiGenerator { client })
+                Box::new(llm::generate::CliGenerator { cli })
             }
             None => {
-                eprintln!("note: ANTHROPIC_API_KEY is not set — using stub questions");
+                eprintln!("note: `claude` is not on PATH — using stub questions");
                 Box::new(llm::stub::StubGenerator)
             }
         };
@@ -211,8 +211,8 @@ impl Ready {
         println!("\n{coverage}\n");
 
         // Step 4 replaces this with the TUI. Plain stdin keeps it honest for now.
-        let judge: Box<dyn llm::Judge> = match llm::anthropic::Client::from_env()? {
-            Some(client) => Box::new(llm::judge::ApiJudge { client, diff: diff.clone() }),
+        let judge: Box<dyn llm::Judge> = match llm::cli::Cli::detect() {
+            Some(cli) => Box::new(llm::judge::CliJudge { cli, diff: diff.clone() }),
             None => Box::new(llm::stub::StubJudge),
         };
         let judge = judge.as_ref();

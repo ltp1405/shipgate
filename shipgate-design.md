@@ -234,13 +234,15 @@ System prompt, in short: produce three to six questions that cannot be answered 
 ]
 ```
 
-Responses use **structured outputs** (`output_config.format` with a JSON schema), which is stable on `claude-opus-5` and `claude-sonnet-5` and needs no beta header. The response is guaranteed to match the schema, so there are no code fences to strip and no parse-retry path — an earlier draft specified both. Schemas must set `additionalProperties: false` on every object and cannot use `minimum` / `maxLength`-style constraints; those return a 400.
+Calls go through the Claude Code CLI (`claude -p --output-format json --restricted`), not the Messages API. Rust has no official Anthropic SDK, so a raw-HTTP client could only ever be checked against documentation rather than a live response — it was written, could not be exercised, and was removed. `--restricted` strips the tools that run commands or code: this needs text in and text out, and the subprocess has no business touching the repository it is being asked about.
+
+The CLI has no schema enforcement, so the expected shape is stated in the prompt and the reply is parsed with a **string-aware brace scanner** — a `{` inside a quoted value is common in answers that quote code, and naive brace counting mis-terminates on it. On a parse failure the model is asked once more with the error appended.
 
 Anchors are still verified locally. A model can return an anchor string that matches no hunk, and an unverified one would silently corrupt coverage accounting and the §9 re-quiz path, so an unknown anchor is remapped onto a real hunk rather than trusted.
 
 ## 8. `judge`
 
-**Grade with a different model than the one that generated** — `claude-opus-5` generates, `claude-sonnet-5` judges. The generator writes the question, the reference *and* — under a single-model design — the grade. A wrong premise then sails through all three unchallenged, and dispute mode is the only escape, which requires you to spot it yourself. Different models do not eliminate correlated error (same family, overlapping training) but they decorrelate it materially, and the cost is zero: generate with the stronger model, judge with the cheaper one. Record `judge_model` on every attempt so a calibration shift is visible later rather than inferred.
+**Grade with a different model than the one that generated** — opus generates, sonnet judges. The generator writes the question, the reference *and* — under a single-model design — the grade. A wrong premise then sails through all three unchallenged, and dispute mode is the only escape, which requires you to spot it yourself. Different models do not eliminate correlated error (same family, overlapping training) but they decorrelate it materially, and the cost is zero: generate with the stronger model, judge with the cheaper one. Record `judge_model` on every attempt so a calibration shift is visible later rather than inferred.
 
 This is a mitigation, not a fix. The real defence is `checkable` questions, whose answers come from running code.
 
@@ -256,7 +258,7 @@ This is a mitigation, not a fix. The real defence is `checkable` questions, whos
 
 **Deterministic precheck, before any API call.** If the answer contains no literal token from the diff — identifier, line number, file name — label it `wrong` locally at zero cost. v1's rubric published its own answer key ("reward consequences, invariants, failure modes, facts not literally present"), and one sentence naming a rollback gap, an unvalidated input and a concurrency invariant scores well on a large fraction of diffs without reading any code. The judge prompt also carries the explicit negative: *score `wrong` if the answer would be equally true of an arbitrary code change.*
 
-**Borderline re-judge.** At `partial` — the label that decides a pass under drop-lowest — re-judge twice and take the median label. An earlier draft said "at temperature 0"; that is not available. `temperature`, `top_p` and `top_k` are **rejected with a 400** on Opus 5 and Sonnet 5, so the re-runs are plain repeats and the median is taken over the model's natural variance. A failed re-judge keeps the first label rather than failing the answer.
+**Borderline re-judge.** At `partial` — the label that decides a pass under drop-lowest — re-judge twice and take the median label. An earlier draft said "at temperature 0"; there is no temperature control through the CLI, so the re-runs are plain repeats and the median is taken over the model's natural variance. A failed re-judge keeps the first label rather than failing the answer.
 
 **Pass rule: drop-lowest, not min.** All but one question at `partial` or better, and the dropped one no worse than `restates`.
 
@@ -272,7 +274,7 @@ Guards, because v1 made dispute-everything free:
 
 - at most one dispute per question, two per gate
 - the body must cite a file and line present in the diff, checked locally before the call
-- a high bar, stated in the prompt rather than through sampling parameters, which these models reject: upheld only if the judge can state the concrete failing input or quote the contradicted line
+- a high bar, stated in the prompt rather than through sampling parameters: upheld only if the judge can state the concrete failing input or quote the contradicted line
 - **`code_bug` does not auto-pass.** The question goes to `deferred`, the gate can still clear, and an `obligations` row opens — settled by fixing the bug or withdrawing the claim before the next gate on that repo clears
 - `premise` / `reference` upheld drops the question and regenerates one replacement for the same anchor
 - not upheld is recorded as a scored attempt with the judge's feedback
@@ -360,11 +362,25 @@ After submit: label, feedback, and the reference revealed on `demonstrates` or a
 
 ## 13. Cost
 
-A 300-line AI-authored slice is roughly 4k tokens; context adds ~1k. Scoping to AI hunks cuts generator input on mixed PRs, often by half.
+**Measured, not estimated.** Model calls go through the Claude Code CLI (`claude -p`), which uses its own credentials — there is no Anthropic SDK for Rust, and an unverifiable raw-HTTP client had no place in the repo.
 
-Roughly 25k in / 4k out per PR — about $0.10, or ~$0.03 with prompt caching on the diff block, written once in `generate` and read by every judge call. At one to three PRs a day, a rounding error.
+Two real runs against this project's own PR, 19 AI-authored hunks:
 
-v1's Stop hook fired at every Claude Code turn end: 10–25 gates and 30–100 questions a day. The cost was survivable; the question volume was not.
+| | cost |
+|---|---|
+| `generate` (opus), cold | $0.91 |
+| `generate` (opus), warm | $0.32 |
+| `judge` (sonnet), per answered question | ~$0.05–0.15 |
+| answers killed by the §8 precheck | $0.00 |
+
+So a PR with six questions, all genuinely answered, lands around **$1.00–1.80**. An earlier draft of this section estimated $0.03–0.10 per PR from token counts alone. That was wrong by more than an order of magnitude, for two reasons it did not account for:
+
+- **The CLI carries its own system prompt.** Every call pays ~12k cache-creation tokens before the diff is even sent. `--system-prompt` replaces the default but does not remove the overhead. A hello-world call costs $0.05.
+- **Opus for generation is most of the bill.** Judging on sonnet is comparatively cheap.
+
+Levers, in order of value: drop generation to sonnet (loses some of the §8 decorrelation, since the judge is already sonnet); ask for three questions rather than six; keep the precheck, which is free and killed five of six answers in the run above.
+
+Even at $1.50, this is a rounding error against the time a PR takes to review — but it is not free, and it scales with PR count, not with repo size. v1's Stop hook fired at every Claude Code turn end: 10–25 gates a day at this price would be $15–35 a day, which settles that placement question on cost alone.
 
 ## 14. Build order
 
