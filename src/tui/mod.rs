@@ -36,7 +36,7 @@ pub enum AppEvent {
     },
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Mode {
     /// Typing an answer.
     Answering,
@@ -126,6 +126,29 @@ fn build_diff_view(diff: &str, ai_hunks: &[git::Hunk]) -> Vec<(String, bool)> {
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+/// Where key events come from. The real loop reads the terminal; tests feed a
+/// scripted sequence, which is what makes the event loop testable at all.
+pub trait Input {
+    /// `None` means nothing is ready yet — the loop should keep polling.
+    /// The app is passed so a scripted source can wait for a call in flight the
+    /// way a person does, rather than racing it.
+    fn next(&mut self, app: &App) -> Result<Option<event::KeyEvent>>;
+}
+
+pub struct TerminalInput;
+
+impl Input for TerminalInput {
+    fn next(&mut self, _app: &App) -> Result<Option<event::KeyEvent>> {
+        if !event::poll(Duration::from_millis(16))? {
+            return Ok(None);
+        }
+        match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => Ok(Some(k)),
+            _ => Ok(None),
+        }
+    }
+}
+
 fn setup() -> Result<Term> {
     enable_raw_mode()?;
     let mut out = std::io::stdout();
@@ -185,15 +208,57 @@ pub fn run(
     let (tx, rx): (Sender<AppEvent>, Receiver<AppEvent>) = mpsc::channel();
     let mut terminal = setup()?;
 
-    let result = event_loop(&mut terminal, &mut app, conn, &judge, &diff, ai_hunks, &tx, &rx);
+    let result = event_loop(
+        &mut Editor::Terminal(&mut terminal),
+        &mut TerminalInput,
+        &mut app,
+        conn,
+        &judge,
+        &diff,
+        ai_hunks,
+        &tx,
+        &rx,
+    );
     restore(&mut terminal)?;
     result?;
     Ok(app.scores)
 }
 
 #[allow(clippy::too_many_arguments)]
+/// How the loop draws and shells out to $EDITOR. Headless runs do neither.
+pub enum Editor<'a> {
+    Terminal(&'a mut Term),
+    Headless,
+}
+
+impl Editor<'_> {
+    fn draw(&mut self, app: &App) -> Result<()> {
+        if let Editor::Terminal(t) = self {
+            t.draw(|f| quiz::render(f, app))?;
+        }
+        Ok(())
+    }
+
+    fn edit(&mut self, current: &str) -> Result<String> {
+        match self {
+            Editor::Terminal(t) => edit_externally(t, current),
+            // Headless: stand in for what the editor would have produced, so the
+            // answer path can be driven without spawning one.
+            Editor::Headless => Ok(if current.is_empty() {
+                "retry_count in sync.rs:88 is never decremented, so the caller \
+                 sees Err(Transient) on the first failure."
+                    .to_string()
+            } else {
+                current.to_string()
+            }),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn event_loop(
-    terminal: &mut Term,
+    ui: &mut Editor,
+    input: &mut dyn Input,
     app: &mut App,
     conn: &Connection,
     judge: &Arc<dyn llm::Judge + Send + Sync>,
@@ -203,7 +268,7 @@ fn event_loop(
     rx: &Receiver<AppEvent>,
 ) -> Result<()> {
     loop {
-        terminal.draw(|f| quiz::render(f, app))?;
+        ui.draw(app)?;
 
         // Non-blocking: results from the worker, then key input.
         while let Ok(ev) = rx.try_recv() {
@@ -227,13 +292,7 @@ fn event_loop(
             }
         }
 
-        if !event::poll(Duration::from_millis(16))? {
-            continue;
-        }
-        let Event::Key(key) = event::read()? else { continue };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
+        let Some(key) = input.next(app)? else { continue };
 
         // Grading is in flight: accept nothing but quit.
         if app.mode == Mode::Grading {
@@ -281,7 +340,7 @@ fn event_loop(
             }
 
             (KeyCode::Char('a'), _) | (KeyCode::Char('e'), _) => {
-                app.answer = edit_externally(terminal, &app.answer)?;
+                app.answer = ui.edit(&app.answer)?;
                 if !app.answer.is_empty() {
                     app.mode = Mode::Answering;
                     app.verdict = None;
@@ -354,6 +413,84 @@ fn submit(
         };
         let _ = tx.send(ev);
     });
+}
+
+/// Drive the loop with scripted keys and no terminal. Returns the final app so
+/// tests can assert on what the loop did.
+#[cfg(test)]
+pub fn run_headless(
+    conn: &Connection,
+    judge: Arc<dyn llm::Judge + Send + Sync>,
+    diff: Arc<String>,
+    ai_hunks: &[git::Hunk],
+    questions: Vec<db::Question>,
+    keys: Vec<event::KeyEvent>,
+    // `false` fires keys regardless of a call in flight, to prove the loop
+    // drops them rather than acting on them late.
+    wait_for_grading: bool,
+) -> Result<App> {
+    struct Scripted {
+        keys: std::vec::IntoIter<event::KeyEvent>,
+        polls: usize,
+        wait_for_grading: bool,
+    }
+
+    impl Input for Scripted {
+        fn next(&mut self, app: &App) -> Result<Option<event::KeyEvent>> {
+            // A judge call is in flight. Hold, as a person would, so the verdict
+            // is processed before the next key is delivered.
+            if app.mode == Mode::Grading && self.wait_for_grading {
+                self.polls += 1;
+                if self.polls > 20_000 {
+                    anyhow::bail!("a scripted judge call never returned");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                return Ok(None);
+            }
+            self.polls = 0;
+            match self.keys.next() {
+                Some(k) => Ok(Some(k)),
+                // Out of keys. If something is still in flight, hold for it so
+                // the verdict lands before the loop stops.
+                None if app.mode == Mode::Grading => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    Ok(None)
+                }
+                None => Ok(Some(event::KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::NONE,
+                ))),
+            }
+        }
+    }
+
+    let total = questions.len();
+    let mut app = App {
+        questions,
+        current: 0,
+        answer: String::new(),
+        mode: Mode::Answering,
+        hints_shown: 0,
+        verdict: None,
+        scores: vec![0.0; total],
+        diff: build_diff_view(&diff, ai_hunks),
+        scroll: 0,
+        status: String::new(),
+        quit: false,
+    };
+    let (tx, rx) = mpsc::channel();
+    event_loop(
+        &mut Editor::Headless,
+        &mut Scripted { keys: keys.into_iter(), polls: 0, wait_for_grading },
+        &mut app,
+        conn,
+        &judge,
+        &diff,
+        ai_hunks,
+        &tx,
+        &rx,
+    )?;
+    Ok(app)
 }
 
 #[cfg(test)]
@@ -453,5 +590,187 @@ diff --git a/src/mine.rs b/src/mine.rs
             landed.contains("typed_by_hand"),
             "jumped to the wrong file; saw:\n{landed}"
         );
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+    use crate::llm::Label;
+    use std::time::Duration;
+
+    fn key(c: char) -> event::KeyEvent {
+        event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn ctrl(c: char) -> event::KeyEvent {
+        event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    const DIFF: &str = "\
+diff --git a/sync.rs b/sync.rs
+--- a/sync.rs
++++ b/sync.rs
+@@ -88,1 +88,2 @@
++    let retry_count = 3;
+";
+
+    /// Tests run in parallel, so every fixture needs its own database file.
+    /// Keying on the process id alone collides between tests that ask for the
+    /// same number of questions.
+    static FIXTURE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn fixture(n: usize) -> (rusqlite::Connection, Vec<git::Hunk>, Vec<db::Question>) {
+        let seq = FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir()
+            .join(format!("shipgate-tui-{}-{seq}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = db::open_at(&path).unwrap();
+
+        let hunks = git::parse_diff(DIFF);
+        let gate = db::upsert_gate(
+            &conn,
+            &db::NewGate {
+                repo: "o/r", pr_number: 1, branch: "b", base_ref: "origin/main",
+                base_sha: "a", head_sha: "b", diff: DIFF,
+                hunks_total: 1, hunks_ai: 1, authorship: "trailers", state: "open",
+            },
+        )
+        .unwrap();
+
+        let qs: Vec<db::NewQuestion> = (0..n)
+            .map(|_| db::NewQuestion {
+                kind: "prediction", file: "sync.rs", anchor: &hunks[0].anchor,
+                text: "what does the caller observe?", reference: "the reference",
+                hints: &[],
+            })
+            .collect();
+        db::insert_questions(&conn, gate, &qs).unwrap();
+        let questions = db::questions_for(&conn, gate).unwrap();
+        (conn, hunks, questions)
+    }
+
+    fn drive(
+        n: usize,
+        judge: llm::stub::StubJudge,
+        keys: Vec<event::KeyEvent>,
+    ) -> App {
+        let (conn, hunks, questions) = fixture(n);
+        run_headless(
+            &conn,
+            Arc::new(judge),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            keys,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn answering_then_submitting_records_the_scripted_verdict() {
+        let app = drive(
+            1,
+            llm::stub::StubJudge::scripted([Some(Label::Demonstrates)]),
+            vec![key('a'), ctrl('s')],
+        );
+        assert_eq!(app.scores[0], Label::Demonstrates.score());
+        assert!(matches!(app.verdict, Some((Label::Demonstrates, _))));
+    }
+
+    /// The precheck must run on the UI thread and cost nothing — an answer
+    /// citing nothing never reaches the judge.
+    #[test]
+    fn an_answer_citing_nothing_is_rejected_without_consulting_the_judge() {
+        let (conn, hunks, questions) = fixture(1);
+        let mut app = App {
+            questions, current: 0,
+            answer: "This could fail and leave state inconsistent.".into(),
+            mode: Mode::Answering, hints_shown: 0, verdict: None, scores: vec![0.0],
+            diff: build_diff_view(DIFF, &hunks), scroll: 0,
+            status: String::new(), quit: false,
+        };
+        let (tx, rx) = mpsc::channel();
+        // A judge scripted to fail: reaching it would surface as an error.
+        let judge: Arc<dyn llm::Judge + Send + Sync> =
+            Arc::new(llm::stub::StubJudge::scripted([None]));
+        submit(&mut app, &judge, &Arc::new(DIFF.to_string()), &hunks, &tx);
+
+        match rx.recv().unwrap() {
+            AppEvent::Graded { label, .. } => assert_eq!(label, Label::Wrong),
+            AppEvent::Failed { error, .. } => panic!("reached the judge: {error}"),
+        }
+        drop(conn);
+    }
+
+    #[test]
+    fn a_failed_judge_call_returns_to_answering_rather_than_hanging() {
+        let app = drive(
+            1,
+            llm::stub::StubJudge::scripted([None]),
+            vec![key('a'), ctrl('s')],
+        );
+        assert!(app.status.contains("grading failed"), "status: {}", app.status);
+        assert_eq!(app.mode, Mode::Answering);
+    }
+
+    #[test]
+    fn space_advances_and_clears_the_previous_answer() {
+        let app = drive(
+            2,
+            llm::stub::StubJudge::scripted([Some(Label::Demonstrates)]),
+            vec![key('a'), ctrl('s'), key(' ')],
+        );
+        assert_eq!(app.current, 1);
+        assert!(app.answer.is_empty());
+        assert!(app.verdict.is_none());
+        assert_eq!(app.mode, Mode::Answering);
+    }
+
+    /// While a call is in flight the loop must keep running and ignore input —
+    /// not block, and not accept a second submit.
+    /// Keys that land while a judge call is in flight must be dropped, not
+    /// queued and acted on when it returns.
+    #[test]
+    fn input_is_ignored_while_grading_is_in_flight() {
+        let (conn, hunks, questions) = fixture(2);
+        let app = run_headless(
+            &conn,
+            Arc::new(
+                llm::stub::StubJudge::scripted([Some(Label::Partial)])
+                    .with_delay(Duration::from_millis(150)),
+            ),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('a'), ctrl('s'), key(' '), key(' '), key(' ')],
+            false,
+        )
+        .unwrap();
+        assert_eq!(app.current, 0, "advanced while a judge call was in flight");
+    }
+
+    #[test]
+    fn hints_reveal_one_at_a_time_and_stop_at_the_end() {
+        let (conn, hunks, mut questions) = fixture(1);
+        questions[0].hints = vec!["one".into(), "two".into()];
+        let app = run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::default()),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('h'), key('h'), key('h')],
+            true,
+        )
+        .unwrap();
+        assert_eq!(app.hints_shown, 2);
+        assert!(app.status.contains("no more hints"));
+    }
+
+    #[test]
+    fn scrolling_never_goes_above_the_top() {
+        let app = drive(1, llm::stub::StubJudge::default(), vec![key('k'), key('k')]);
+        assert_eq!(app.scroll, 0);
     }
 }

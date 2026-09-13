@@ -31,6 +31,9 @@ enum Command {
         /// ones. Free, and keeps the questions stable while you iterate.
         #[arg(long)]
         reuse: bool,
+        /// Use offline stand-ins instead of the model. No cost, no network.
+        #[arg(long)]
+        offline: bool,
     },
     /// PRs that went ready without a gate, plus open obligations.
     Status,
@@ -40,7 +43,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir()?;
     match cli.command {
-        Command::Ready { dry_run, reuse } => gate::Ready { dry_run, reuse }.run(&cwd),
+        Command::Ready { dry_run, reuse, offline } => {
+            gate::Ready { dry_run, reuse, offline }.run(&cwd)
+        }
         Command::Status => gate::status(&cwd),
     }
 }

@@ -59,6 +59,8 @@ pub fn passes(scores: &[f64]) -> bool {
 
 pub struct Ready {
     pub dry_run: bool,
+    /// Use the offline stand-ins instead of the model. No cost, no network.
+    pub offline: bool,
     /// Replay the stored gate instead of generating. Generation is the
     /// expensive half, so without this every look at the quiz costs a model
     /// call.
@@ -67,6 +69,9 @@ pub struct Ready {
 
 impl Ready {
     pub fn run(&self, cwd: &Path) -> Result<()> {
+        if self.offline {
+            eprintln!("note: --offline — questions and grading are stand-ins, not real");
+        }
         let dir = git::repo_root(cwd)?;
         let branch = git::current_branch(&dir)?;
         let repo = gh::repo_slug(&dir)?;
@@ -182,15 +187,12 @@ impl Ready {
             eprintln!("note: no test command found — no checkable question is possible");
         }
 
-        let generator: Box<dyn llm::Generator> = match llm::cli::Cli::detect() {
+        let generator: Box<dyn llm::Generator> = match self.backend() {
             Some(cli) => {
                 println!("Generating questions…");
                 Box::new(llm::generate::CliGenerator { cli })
             }
-            None => {
-                eprintln!("note: `claude` is not on PATH — using stub questions");
-                Box::new(llm::stub::StubGenerator)
-            }
+            None => Box::new(llm::stub::StubGenerator),
         };
         let Some(generated) = generator.generate(&ctx)? else {
             println!("Generator declined: nothing worth asking.");
@@ -239,6 +241,22 @@ impl Ready {
         db::set_gate_state(&conn, gate_id, "cleared")?;
         let body = self.description(&conn, &dir, &pr, &questions, &coverage)?;
         self.submit(&dir, &pr, &body)
+    }
+
+    /// The model backend, or `None` to run offline. `--offline` forces the
+    /// stand-ins; a missing `claude` falls back to them with a warning, since
+    /// silently producing stub questions would look like real ones.
+    fn backend(&self) -> Option<llm::cli::Cli> {
+        if self.offline {
+            return None;
+        }
+        match llm::cli::Cli::detect() {
+            Some(cli) => Some(cli),
+            None => {
+                eprintln!("note: `claude` is not on PATH — falling back to stand-ins");
+                None
+            }
+        }
     }
 
     /// Re-run the quiz from the stored gate: same diff, same questions, no model
@@ -312,9 +330,9 @@ impl Ready {
         ai_hunks: &[git::Hunk],
         questions: Vec<db::Question>,
     ) -> Result<Vec<f64>> {
-        let judge: Arc<dyn llm::Judge + Send + Sync> = match llm::cli::Cli::detect() {
+        let judge: Arc<dyn llm::Judge + Send + Sync> = match self.backend() {
             Some(cli) => Arc::new(llm::judge::CliJudge { cli, diff: diff.to_string() }),
-            None => Arc::new(llm::stub::StubJudge),
+            None => Arc::new(llm::stub::StubJudge::default()),
         };
 
         // The TUI needs a terminal. Piped stdin keeps `--dry-run` scriptable.

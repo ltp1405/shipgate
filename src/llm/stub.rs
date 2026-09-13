@@ -1,9 +1,15 @@
-//! Step 1 only. Hardcoded questions and a judge that passes any answer over 40
-//! characters, so `shipgate ready` can be proven end to end — the `gh pr ready`
-//! flip and the description write — before the model work in steps 2 and 3.
+//! Offline stand-ins for the model, selected by `--offline`.
+//!
+//! These exist so the gate flow and the TUI can be exercised without spending a
+//! model call: generation is the expensive half, and the states most likely to
+//! be broken in the UI — a call in flight, each verdict, a failure — are exactly
+//! the ones a real judge makes slow and expensive to reach.
 
 use super::{Context, Generated, Generator, Judge, Label, Verdict};
-use anyhow::Result;
+use anyhow::{bail, Result};
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::Duration;
 
 pub struct StubGenerator;
 
@@ -63,23 +69,77 @@ impl Generator for StubGenerator {
     }
 }
 
-pub struct StubJudge;
+/// A judge that returns scripted verdicts instead of grading.
+///
+/// Length-based grading cannot reach `partial` or a failure, so it cannot
+/// exercise the UI states around them. A script can.
+pub struct StubJudge {
+    /// Verdicts to return in order. Once exhausted, the last one repeats.
+    /// `None` is a failed call.
+    pub script: Mutex<VecDeque<Option<Label>>>,
+    /// Simulated latency, so the "grading…" state is observable.
+    pub delay: Duration,
+}
+
+impl Default for StubJudge {
+    /// Length-based, matching the old behaviour: a real attempt passes, a
+    /// one-liner does not.
+    fn default() -> Self {
+        Self { script: Mutex::new(VecDeque::new()), delay: Duration::ZERO }
+    }
+}
+
+impl StubJudge {
+    pub fn scripted(labels: impl IntoIterator<Item = Option<Label>>) -> Self {
+        Self {
+            script: Mutex::new(labels.into_iter().collect()),
+            delay: Duration::ZERO,
+        }
+    }
+
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+}
 
 impl Judge for StubJudge {
     fn judge(&self, _diff: &str, _question: &str, answer: &str) -> Result<Verdict> {
-        if answer.trim().len() > 40 {
-            Ok(Verdict {
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+
+        // Outer None: no script at all. Inner None: a scripted failure.
+        // The last entry is peeked rather than popped, so it repeats instead of
+        // falling back to length-based grading partway through a run.
+        let scripted: Option<Option<Label>> = {
+            let mut q = self.script.lock().unwrap();
+            if q.len() > 1 {
+                q.pop_front()
+            } else {
+                q.front().copied()
+            }
+        };
+
+        match scripted {
+            Some(Some(label)) => Ok(Verdict {
+                label,
+                feedback: format!("[offline] scripted verdict: {}", label.as_str()),
+            }),
+            Some(None) => bail!("[offline] scripted failure"),
+            // No script: fall back to length, which is enough for a smoke test.
+            None if answer.trim().len() > 40 => Ok(Verdict {
                 label: Label::Demonstrates,
-                feedback: "[stub judge] accepted on length; real grading lands in step 3.".into(),
-            })
-        } else {
-            Ok(Verdict {
+                feedback: "[offline] accepted on length — no real grading happened.".into(),
+            }),
+            None => Ok(Verdict {
                 label: Label::Restates,
-                feedback: "[stub judge] too short to be a real answer.".into(),
-            })
+                feedback: "[offline] too short to be a real answer.".into(),
+            }),
         }
     }
+
     fn model(&self) -> &str {
-        "stub"
+        "offline-stub"
     }
 }
