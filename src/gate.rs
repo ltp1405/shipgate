@@ -1,11 +1,12 @@
 //! Gate lifecycle, pass rule, coverage, and the PR description — the thing that
 //! makes `shipgate ready` worth running instead of `gh pr ready`.
 
-use crate::{authorship, config, context, db, gh, git, llm, triage};
+use crate::{authorship, config, context, db, gh, git, llm, triage, tui};
 use anyhow::{bail, Context as _, Result};
 use rusqlite::Connection;
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+use std::sync::Arc;
 use std::path::Path;
 
 pub struct Coverage {
@@ -210,18 +211,31 @@ impl Ready {
         };
         println!("\n{coverage}\n");
 
-        // Step 4 replaces this with the TUI. Plain stdin keeps it honest for now.
-        let judge: Box<dyn llm::Judge> = match llm::cli::Cli::detect() {
-            Some(cli) => Box::new(llm::judge::CliJudge { cli, diff: diff.clone() }),
-            None => Box::new(llm::stub::StubJudge),
+        let judge: Arc<dyn llm::Judge + Send + Sync> = match llm::cli::Cli::detect() {
+            Some(cli) => Arc::new(llm::judge::CliJudge { cli, diff: diff.clone() }),
+            None => Arc::new(llm::stub::StubJudge),
         };
-        let judge = judge.as_ref();
         let questions = db::questions_for(&conn, gate_id)?;
-        let mut scores = Vec::new();
-        for (i, q) in questions.iter().enumerate() {
-            let score = self.ask(&conn, judge, &diff, &ai_hunks, q, i + 1, questions.len())?;
-            scores.push(score);
-        }
+
+        // The TUI needs a terminal. Piped stdin keeps `--dry-run` scriptable and
+        // is what the tests drive.
+        let scores = if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+            tui::run(
+                &conn,
+                Arc::clone(&judge),
+                Arc::new(diff.clone()),
+                &ai_hunks,
+                questions.clone(),
+            )?
+        } else {
+            let mut scores = Vec::new();
+            for (i, q) in questions.iter().enumerate() {
+                let score =
+                    self.ask(&conn, judge.as_ref(), &diff, &ai_hunks, q, i + 1, questions.len())?;
+                scores.push(score);
+            }
+            scores
+        };
 
         if !passes(&scores) {
             println!("\nNot cleared. Re-run when you want another go — disagreements are cheap.");

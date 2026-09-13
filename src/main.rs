@@ -7,6 +7,7 @@ mod gh;
 mod git;
 mod llm;
 mod triage;
+mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
