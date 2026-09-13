@@ -46,6 +46,17 @@ pub enum Mode {
     Reviewing,
 }
 
+/// One rendered diff row, with everything the pane needs to place it.
+pub struct DiffLine {
+    pub text: String,
+    pub ai: bool,
+    /// New-side line number. `None` for removed lines and headers, which have
+    /// none — the questions cite new-side positions.
+    pub lineno: Option<u32>,
+    pub is_hunk_header: bool,
+    pub is_file_header: bool,
+}
+
 pub struct App {
     pub questions: Vec<db::Question>,
     pub current: usize,
@@ -54,9 +65,14 @@ pub struct App {
     pub hints_shown: usize,
     pub verdict: Option<(llm::Label, String)>,
     pub scores: Vec<f64>,
-    /// The diff, split into lines, with a flag for AI-authored hunks.
-    pub diff: Vec<(String, bool)>,
+    pub diff: Vec<DiffLine>,
     pub scroll: u16,
+    /// Horizontal offset. Code lines routinely exceed the pane, and wrapping
+    /// them would destroy the indentation that makes code readable.
+    pub hscroll: u16,
+    /// Rows the diff pane last drew, so scrolling can be clamped to content.
+    /// Only the renderer knows the height.
+    pub viewport: std::cell::Cell<u16>,
     pub status: String,
     pub quit: bool,
 }
@@ -72,6 +88,49 @@ impl App {
     /// The search is anchored to the question's file first. Matching the `@@`
     /// header alone jumps to whichever file happens to share that header — with
     /// headers as common as `@@ -1,1 +1,2 @@` that is routinely the wrong one.
+    /// Highest useful scroll offset. Without this `j` runs off the end into
+    /// unbounded blank space with nothing to say you have overrun.
+    pub fn max_scroll(&self) -> u16 {
+        let viewport = self.viewport.get().max(1);
+        (self.diff.len() as u16).saturating_sub(viewport)
+    }
+
+    pub fn scroll_by(&mut self, delta: i32) {
+        let next = (self.scroll as i32 + delta).max(0) as u16;
+        self.scroll = next.min(self.max_scroll());
+    }
+
+    /// Move to the next or previous row matching `pred`, by hunk or by file.
+    fn jump(&mut self, forward: bool, pred: impl Fn(&DiffLine) -> bool) {
+        let here = self.scroll as usize;
+        let found = if forward {
+            self.diff
+                .iter()
+                .enumerate()
+                .find(|(i, d)| *i > here && pred(d))
+                .map(|(i, _)| i)
+        } else {
+            self.diff
+                .iter()
+                .enumerate()
+                .take(here)
+                .filter(|(_, d)| pred(d))
+                .next_back()
+                .map(|(i, _)| i)
+        };
+        if let Some(i) = found {
+            self.scroll = (i as u16).min(self.max_scroll());
+        }
+    }
+
+    pub fn jump_hunk(&mut self, forward: bool) {
+        self.jump(forward, |d| d.is_hunk_header);
+    }
+
+    pub fn jump_file(&mut self, forward: bool) {
+        self.jump(forward, |d| d.is_file_header);
+    }
+
     fn jump_to_anchor(&mut self, hunks: &[git::Hunk]) {
         let Some(q) = self.questions.get(self.current) else { return };
         let Some(hunk) = hunks.iter().find(|h| h.anchor == q.anchor) else { return };
@@ -79,16 +138,17 @@ impl App {
         let file_start = self
             .diff
             .iter()
-            .position(|(l, _)| l.starts_with("diff --git") && l.ends_with(&format!("b/{}", q.file)))
+            .position(|d| d.is_file_header && d.text.ends_with(&format!("b/{}", q.file)))
             .unwrap_or(0);
 
         let found = self.diff[file_start..]
             .iter()
-            .position(|(l, _)| l == &hunk.header)
+            .position(|d| d.text == hunk.header)
             .map(|offset| file_start + offset);
 
         if let Some(idx) = found {
-            self.scroll = idx.saturating_sub(3) as u16;
+            self.scroll = (idx.saturating_sub(3) as u16).min(self.max_scroll());
+            self.hscroll = 0;
         }
     }
 }
@@ -98,7 +158,14 @@ impl App {
 /// Keyed on `(file, header)`, not the header alone: `@@ -1,1 +1,2 @@` recurs
 /// across files, so matching on the header by itself marks unrelated hunks in
 /// other files as AI-authored.
-fn build_diff_view(diff: &str, ai_hunks: &[git::Hunk]) -> Vec<(String, bool)> {
+/// Parse the new-side start out of `@@ -12,3 +88,9 @@`.
+fn hunk_start(header: &str) -> Option<u32> {
+    let plus = header.split('+').nth(1)?;
+    let digits: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn build_diff_view(diff: &str, ai_hunks: &[git::Hunk]) -> Vec<DiffLine> {
     let ai: std::collections::HashSet<(&str, &str)> = ai_hunks
         .iter()
         .map(|h| (h.file.as_str(), h.header.as_str()))
@@ -107,10 +174,17 @@ fn build_diff_view(diff: &str, ai_hunks: &[git::Hunk]) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut file = String::new();
     let mut in_ai_hunk = false;
+    let mut lineno: Option<u32> = None;
 
     for line in diff.lines() {
+        let mut is_file_header = false;
+        let mut is_hunk_header = false;
+        let mut number = None;
+
         if let Some(rest) = line.strip_prefix("diff --git ") {
             in_ai_hunk = false;
+            lineno = None;
+            is_file_header = true;
             file = rest
                 .split(" b/")
                 .nth(1)
@@ -118,11 +192,33 @@ fn build_diff_view(diff: &str, ai_hunks: &[git::Hunk]) -> Vec<(String, bool)> {
                 .to_string();
         } else if line.starts_with("@@") {
             in_ai_hunk = ai.contains(&(file.as_str(), line));
+            is_hunk_header = true;
+            lineno = hunk_start(line);
+        } else if line.starts_with("---") || line.starts_with("+++") || line.starts_with("index ") {
+            // File metadata, not content.
+        } else if let Some(n) = lineno {
+            // Removed lines occupy no new-side number; context and additions do.
+            if !line.starts_with('-') {
+                number = Some(n);
+                lineno = Some(n + 1);
+            }
         }
-        out.push((line.to_string(), in_ai_hunk));
+
+        out.push(DiffLine {
+            text: line.to_string(),
+            ai: in_ai_hunk,
+            lineno: number,
+            is_hunk_header,
+            is_file_header,
+        });
     }
     out
 }
+
+const STATUS_ANSWERING: &str =
+    "a answer · h hint · n/p hunk · [/] file · g back · ←/→ pan · q quit";
+const STATUS_ANSWERED: &str = "^s submit · e revise · h hint · n/p hunk · g back · q quit";
+const STATUS_REVIEWING: &str = "space next · e revise · n/p hunk · g back · q quit";
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -200,7 +296,9 @@ pub fn run(
         scores: vec![0.0; total],
         diff: build_diff_view(&diff, ai_hunks),
         scroll: 0,
-        status: "a/e answer · h hint · ^s submit · j/k scroll · q quit".into(),
+        hscroll: 0,
+        viewport: std::cell::Cell::new(20),
+        status: STATUS_ANSWERING.into(),
         quit: false,
     };
     app.jump_to_anchor(ai_hunks);
@@ -283,7 +381,7 @@ fn event_loop(
                     )?;
                     app.verdict = Some((label, feedback));
                     app.mode = Mode::Reviewing;
-                    app.status = "space next · e revise · q quit".into();
+                    app.status = STATUS_REVIEWING.into();
                 }
                 AppEvent::Failed { error, .. } => {
                     app.mode = Mode::Answering;
@@ -306,14 +404,22 @@ fn event_loop(
             (KeyCode::Char('q'), _) => return Ok(()),
             _ if is_ctrl_c(&key) => return Ok(()),
 
-            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
-                app.scroll = app.scroll.saturating_add(1)
-            }
-            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
-                app.scroll = app.scroll.saturating_sub(1)
-            }
-            (KeyCode::PageDown, _) => app.scroll = app.scroll.saturating_add(20),
-            (KeyCode::PageUp, _) => app.scroll = app.scroll.saturating_sub(20),
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.scroll_by(1),
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.scroll_by(-1),
+            (KeyCode::PageDown, _) => app.scroll_by(20),
+            (KeyCode::PageUp, _) => app.scroll_by(-20),
+
+            // Horizontal, because long code lines are not wrapped.
+            (KeyCode::Right, _) => app.hscroll = app.hscroll.saturating_add(8),
+            (KeyCode::Left, _) => app.hscroll = app.hscroll.saturating_sub(8),
+
+            (KeyCode::Char('n'), _) => app.jump_hunk(true),
+            (KeyCode::Char('p'), _) => app.jump_hunk(false),
+            (KeyCode::Char(']'), _) => app.jump_file(true),
+            (KeyCode::Char('['), _) => app.jump_file(false),
+
+            // Back to the hunk this question is about, after wandering off.
+            (KeyCode::Char('g'), _) => app.jump_to_anchor(ai_hunks),
 
             // Next question.
             (KeyCode::Char(' '), true) => {
@@ -325,7 +431,7 @@ fn event_loop(
                 app.hints_shown = 0;
                 app.verdict = None;
                 app.mode = Mode::Answering;
-                app.status = "a/e answer · h hint · ^s submit · j/k scroll · q quit".into();
+                app.status = STATUS_ANSWERING.into();
                 app.jump_to_anchor(ai_hunks);
             }
 
@@ -344,7 +450,7 @@ fn event_loop(
                 if !app.answer.is_empty() {
                     app.mode = Mode::Answering;
                     app.verdict = None;
-                    app.status = "^s submit · e revise · h hint · q quit".into();
+                    app.status = STATUS_ANSWERED.into();
                 }
             }
 
@@ -415,6 +521,18 @@ fn submit(
     });
 }
 
+/// Build a diff view for render tests, marking the given hunk indexes as
+/// AI-authored.
+#[cfg(test)]
+pub fn build_diff_view_for_test(diff: &str, ai_hunk_indexes: &[usize]) -> Vec<DiffLine> {
+    let hunks = git::parse_diff(diff);
+    let ai: Vec<git::Hunk> = ai_hunk_indexes
+        .iter()
+        .filter_map(|i| hunks.get(*i).cloned())
+        .collect();
+    build_diff_view(diff, &ai)
+}
+
 /// Drive the loop with scripted keys and no terminal. Returns the final app so
 /// tests can assert on what the loop did.
 #[cfg(test)]
@@ -475,6 +593,8 @@ pub fn run_headless(
         scores: vec![0.0; total],
         diff: build_diff_view(&diff, ai_hunks),
         scroll: 0,
+        hscroll: 0,
+        viewport: std::cell::Cell::new(20),
         status: String::new(),
         quit: false,
     };
@@ -524,8 +644,8 @@ diff --git a/src/mine.rs b/src/mine.rs
         let view = build_diff_view(DIFF, &ai_only());
         let marked: Vec<&String> = view
             .iter()
-            .filter(|(_, ai)| *ai)
-            .map(|(l, _)| l)
+            .filter(|d| d.ai)
+            .map(|d| &d.text)
             .collect();
         assert!(marked.iter().any(|l| l.contains("written_by_the_model")));
         assert!(
@@ -539,9 +659,9 @@ diff --git a/src/mine.rs b/src/mine.rs
         let view = build_diff_view(DIFF, &ai_only());
         let second_file = view
             .iter()
-            .find(|(l, _)| l.contains("diff --git a/src/mine.rs"))
+            .find(|d| d.text.contains("diff --git a/src/mine.rs"))
             .unwrap();
-        assert!(!second_file.1);
+        assert!(!second_file.ai);
     }
 
     #[test]
@@ -574,6 +694,9 @@ diff --git a/src/mine.rs b/src/mine.rs
             scores: vec![0.0],
             diff: build_diff_view(DIFF, &hunks),
             scroll: 0,
+            hscroll: 0,
+            // Smaller than the diff, or the clamp pins every jump to the top.
+            viewport: std::cell::Cell::new(4),
             status: String::new(),
             quit: false,
         };
@@ -583,7 +706,7 @@ diff --git a/src/mine.rs b/src/mine.rs
         let landed = &app.diff[app.scroll as usize..]
             .iter()
             .take(8)
-            .map(|(l, _)| l.clone())
+            .map(|d| d.text.clone())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -687,7 +810,8 @@ diff --git a/sync.rs b/sync.rs
             questions, current: 0,
             answer: "This could fail and leave state inconsistent.".into(),
             mode: Mode::Answering, hints_shown: 0, verdict: None, scores: vec![0.0],
-            diff: build_diff_view(DIFF, &hunks), scroll: 0,
+            diff: build_diff_view(DIFF, &hunks), scroll: 0, hscroll: 0,
+            viewport: std::cell::Cell::new(40),
             status: String::new(), quit: false,
         };
         let (tx, rx) = mpsc::channel();
@@ -772,5 +896,183 @@ diff --git a/sync.rs b/sync.rs
     fn scrolling_never_goes_above_the_top() {
         let app = drive(1, llm::stub::StubJudge::default(), vec![key('k'), key('k')]);
         assert_eq!(app.scroll, 0);
+    }
+}
+
+#[cfg(test)]
+mod diff_nav_tests {
+    use super::*;
+
+    const DIFF: &str = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -10,3 +20,4 @@ fn alpha() {
+ context_one
+-removed_line
++added_line
+ context_two
+diff --git a/b.rs b/b.rs
+--- a/b.rs
++++ b/b.rs
+@@ -1,1 +5,2 @@
++beta_added
+";
+
+    fn view() -> Vec<DiffLine> {
+        build_diff_view(DIFF, &git::parse_diff(DIFF))
+    }
+
+    fn app_with(viewport: u16) -> App {
+        App {
+            questions: vec![],
+            current: 0,
+            answer: String::new(),
+            mode: Mode::Answering,
+            hints_shown: 0,
+            verdict: None,
+            scores: vec![],
+            diff: view(),
+            scroll: 0,
+            hscroll: 0,
+            viewport: std::cell::Cell::new(viewport),
+            status: String::new(),
+            quit: false,
+        }
+    }
+
+    fn numbered(text: &str) -> Option<u32> {
+        view().into_iter().find(|d| d.text.contains(text))?.lineno
+    }
+
+    /// Questions cite new-side positions, so the gutter must count the new side
+    /// from the `@@` header, not the old side and not the row index.
+    #[test]
+    fn line_numbers_come_from_the_new_side_of_the_hunk_header() {
+        assert_eq!(numbered("context_one"), Some(20));
+        assert_eq!(numbered("added_line"), Some(21));
+        assert_eq!(numbered("context_two"), Some(22));
+    }
+
+    #[test]
+    fn removed_lines_have_no_new_side_number() {
+        assert_eq!(numbered("removed_line"), None);
+    }
+
+    #[test]
+    fn a_removed_line_does_not_advance_the_count() {
+        // context_one is 20 and added_line is 21: the removal between them
+        // must not consume a number.
+        assert_eq!(numbered("added_line"), Some(21));
+    }
+
+    #[test]
+    fn each_file_restarts_from_its_own_hunk_header() {
+        assert_eq!(numbered("beta_added"), Some(5));
+    }
+
+    #[test]
+    fn headers_and_metadata_carry_no_number() {
+        for text in ["diff --git", "@@ -10,3", "--- a/a.rs", "+++ b/a.rs"] {
+            assert_eq!(numbered(text), None, "{text} should have no line number");
+        }
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_end_of_the_diff() {
+        let mut app = app_with(5);
+        for _ in 0..500 {
+            app.scroll_by(1);
+        }
+        assert_eq!(app.scroll, app.max_scroll());
+        assert!((app.scroll as usize) < app.diff.len());
+    }
+
+    #[test]
+    fn a_diff_shorter_than_the_viewport_does_not_scroll() {
+        let mut app = app_with(200);
+        app.scroll_by(50);
+        assert_eq!(app.scroll, 0);
+    }
+
+    /// Asserts the target is on screen, not that it is at the top: a hunk near
+    /// the end of the diff cannot be scrolled to the first row, because there
+    /// is not enough content below it. The clamp is right; top-alignment is not
+    /// the contract.
+    fn shows(app: &App, index: usize) -> bool {
+        let start = app.scroll as usize;
+        (start..start + app.viewport.get() as usize).contains(&index)
+    }
+
+    #[test]
+    fn n_and_p_move_between_hunk_headers() {
+        let headers: Vec<usize> = view()
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.is_hunk_header)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(headers.len(), 2, "fixture should have two hunks");
+
+        let mut app = app_with(4);
+        app.jump_hunk(true);
+        assert!(shows(&app, headers[0]), "first hunk not on screen");
+
+        app.jump_hunk(true);
+        assert!(shows(&app, headers[1]), "second hunk not on screen");
+
+        app.jump_hunk(false);
+        assert!(shows(&app, headers[0]), "did not go back to the first hunk");
+    }
+
+    #[test]
+    fn bracket_keys_move_between_files() {
+        let files: Vec<usize> = view()
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.is_file_header)
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut app = app_with(4);
+        app.jump_file(true);
+        assert!(shows(&app, files[1]), "b.rs not on screen");
+        app.jump_file(false);
+        assert!(shows(&app, files[0]), "a.rs not on screen");
+    }
+
+    #[test]
+    fn jumping_past_the_last_hunk_stays_put() {
+        let mut app = app_with(4);
+        for _ in 0..10 {
+            app.jump_hunk(true);
+        }
+        let settled = app.scroll;
+        app.jump_hunk(true);
+        assert_eq!(app.scroll, settled);
+    }
+
+    /// Returning to the question's hunk must also reset the horizontal pan,
+    /// or the reader lands on the right line scrolled off the side.
+    #[test]
+    fn returning_to_the_anchor_resets_the_pan() {
+        let hunks = git::parse_diff(DIFF);
+        let target = &hunks[1];
+        let mut app = app_with(4);
+        app.questions = vec![db::Question {
+            id: 1,
+            kind: "prediction".into(),
+            file: target.file.clone(),
+            anchor: target.anchor.clone(),
+            text: "q".into(),
+            reference: "r".into(),
+            hints: vec![],
+            status: "open".into(),
+            label: None,
+            score: None,
+        }];
+        app.hscroll = 40;
+        app.jump_to_anchor(&hunks);
+        assert_eq!(app.hscroll, 0);
     }
 }

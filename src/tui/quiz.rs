@@ -63,19 +63,68 @@ pub fn render(f: &mut Frame, app: &App) {
 }
 
 fn render_diff(f: &mut Frame, app: &App, area: Rect) {
-    let lines: Vec<Line> = app
-        .diff
+    // Tell the app how much it just drew, so scrolling can be clamped to
+    // content rather than running off into blank space.
+    let inner_h = area.height.saturating_sub(2);
+    let inner_w = area.width.saturating_sub(2) as usize;
+    app.viewport.set(inner_h);
+
+    const GUTTER: usize = 5;
+    // Gutter, its space, and one reserved column for the clip marker. Without
+    // the reservation the marker renders past the pane edge and is clipped
+    // away — leaving truncation as silent as it was before.
+    let text_w = inner_w.saturating_sub(GUTTER + 2);
+
+    let start = app.scroll as usize;
+    let end = (start + inner_h as usize).min(app.diff.len());
+
+    let lines: Vec<Line> = app.diff[start.min(app.diff.len())..end]
         .iter()
-        .map(|(l, ai)| Line::from(Span::styled(l.clone(), diff_line_style(l, *ai))))
+        .map(|d| {
+            let gutter = match d.lineno {
+                Some(n) => format!("{n:>GUTTER$} "),
+                None => " ".repeat(GUTTER + 1),
+            };
+
+            // Pan horizontally instead of wrapping: wrapping destroys the
+            // indentation that makes code readable, and it decouples screen
+            // rows from diff lines, which the jumps and the clamp depend on.
+            let chars: Vec<char> = d.text.chars().collect();
+            let from = (app.hscroll as usize).min(chars.len());
+            let visible: String = chars[from..].iter().take(text_w).collect();
+            // A clipped line must say so. Silently dropping the end of a line
+            // means reading truncated code without knowing it.
+            let clipped = chars.len() > from + text_w;
+
+            let mut spans = vec![Span::styled(
+                gutter,
+                Style::default().fg(Color::DarkGray),
+            )];
+            spans.push(Span::styled(visible, diff_line_style(&d.text, d.ai)));
+            if clipped {
+                spans.push(Span::styled("›", Style::default().fg(Color::Yellow)));
+            }
+            Line::from(spans)
+        })
         .collect();
 
-    let title = format!(
-        " diff · {} lines · dimmed hunks are not AI-authored ",
-        app.diff.len()
+    let position = if app.diff.is_empty() {
+        String::new()
+    } else {
+        format!(" {}–{}/{} ", start + 1, end, app.diff.len())
+    };
+    let pan = if app.hscroll > 0 {
+        format!(" +{} cols ", app.hscroll)
+    } else {
+        String::new()
+    };
+
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" diff{position}{pan}"))
+            .title_bottom(" dimmed = not AI-authored "),
     );
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .scroll((app.scroll, 0));
     f.render_widget(p, area);
 }
 
@@ -165,7 +214,7 @@ mod tests {
     const W: u16 = 100;
     const H: u16 = 30;
 
-    fn question() -> db::Question {
+    pub(super) fn question() -> db::Question {
         db::Question {
             id: 1,
             kind: "prediction".into(),
@@ -189,18 +238,25 @@ mod tests {
             hints_shown: 0,
             verdict: None,
             scores: vec![0.0],
-            diff: vec![
-                ("@@ -88,1 +88,2 @@".into(), true),
-                ("+AIAUTHOREDLINE".into(), true),
-                ("+HANDTYPEDLINE".into(), false),
-            ],
+            // Two files, so the hand-typed one can sit outside the AI scope.
+            diff: crate::tui::build_diff_view_for_test(
+                "diff --git a/src/sync.rs b/src/sync.rs\n\
+                 @@ -88,1 +88,2 @@\n\
+                 +AIAUTHOREDLINE\n\
+                 diff --git a/src/mine.rs b/src/mine.rs\n\
+                 @@ -1,1 +1,2 @@\n\
+                 +HANDTYPEDLINE\n",
+                &[0],
+            ),
             scroll: 0,
+            hscroll: 0,
+            viewport: std::cell::Cell::new(H - 3),
             status: "STATUSLINE".into(),
             quit: false,
         }
     }
 
-    fn draw(app: &App, w: u16, h: u16) -> Buffer {
+    pub(super) fn draw(app: &App, w: u16, h: u16) -> Buffer {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| render(f, app)).unwrap();
         t.backend().buffer().clone()
@@ -208,7 +264,7 @@ mod tests {
 
     /// The buffer is a grid, so a string can be split across cells; join each
     /// row and search the rows.
-    fn rows(buf: &Buffer) -> Vec<String> {
+    pub(super) fn rows(buf: &Buffer) -> Vec<String> {
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
@@ -272,7 +328,10 @@ mod tests {
     #[test]
     fn added_and_removed_lines_are_coloured_differently() {
         let mut a = app();
-        a.diff = vec![("+ADDEDLINE".into(), true), ("-REMOVEDLINE".into(), true)];
+        a.diff = crate::tui::build_diff_view_for_test(
+            "diff --git a/f.rs b/f.rs\n@@ -1,1 +1,2 @@\n+ADDEDLINE\n-REMOVEDLINE\n",
+            &[0, 1],
+        );
         let buf = draw(&a, W, H);
         assert_eq!(style_of(&buf, "ADDEDLINE").fg, Some(Color::Green));
         assert_eq!(style_of(&buf, "REMOVEDLINE").fg, Some(Color::Red));
@@ -360,5 +419,84 @@ mod tests {
         let mut a = app();
         a.questions.clear();
         draw(&a, W, H);
+    }
+}
+
+#[cfg(test)]
+mod diff_render_tests {
+    use super::*;
+    use super::tests::{draw, rows};
+    use crate::tui::{App, Mode};
+
+    const LONG: &str = "diff --git a/f.rs b/f.rs\n@@ -1,1 +7,2 @@\n+ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz\n";
+
+    fn long_app() -> App {
+        App {
+            questions: vec![super::tests::question()],
+            current: 0,
+            answer: String::new(),
+            mode: Mode::Answering,
+            hints_shown: 0,
+            verdict: None,
+            scores: vec![0.0],
+            diff: crate::tui::build_diff_view_for_test(LONG, &[0]),
+            scroll: 0,
+            hscroll: 0,
+            viewport: std::cell::Cell::new(10),
+            status: "s".into(),
+            quit: false,
+        }
+    }
+
+    #[test]
+    fn the_gutter_shows_new_side_line_numbers() {
+        let buf = draw(&long_app(), 60, 12);
+        assert!(
+            rows(&buf).iter().any(|r| r.contains("    7 ")),
+            "line number 7 missing from the gutter"
+        );
+    }
+
+    /// A clipped line must announce itself. Dropping the end of a line silently
+    /// means reading truncated code without knowing it.
+    #[test]
+    fn a_clipped_line_is_marked() {
+        let buf = draw(&long_app(), 44, 12);
+        assert!(rows(&buf).iter().any(|r| r.contains('›')), "no clip marker");
+    }
+
+    #[test]
+    fn a_line_that_fits_is_not_marked() {
+        // The diff pane is 55% of the terminal, so a 63-character line needs a
+        // good deal more than 63 columns of terminal to fit.
+        let buf = draw(&long_app(), 160, 12);
+        assert!(!rows(&buf).iter().any(|r| r.contains('›')));
+    }
+
+    #[test]
+    fn panning_reveals_the_end_of_a_long_line() {
+        let mut a = long_app();
+        let narrow = 44;
+        assert!(!rows(&draw(&a, narrow, 12)).iter().any(|r| r.contains("vwxyz")));
+        a.hscroll = 50;
+        assert!(
+            rows(&draw(&a, narrow, 12)).iter().any(|r| r.contains("vwxyz")),
+            "panning right did not reveal the tail"
+        );
+    }
+
+    #[test]
+    fn the_title_reports_position_and_pan() {
+        let mut a = long_app();
+        assert!(rows(&draw(&a, 60, 12)).iter().any(|r| r.contains("/3")));
+        a.hscroll = 16;
+        assert!(rows(&draw(&a, 60, 12)).iter().any(|r| r.contains("+16 cols")));
+    }
+
+    #[test]
+    fn rendering_past_the_end_does_not_panic() {
+        let mut a = long_app();
+        a.scroll = 9_999;
+        draw(&a, 60, 12);
     }
 }
