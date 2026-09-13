@@ -27,6 +27,10 @@ enum Command {
         /// Run the quiz but touch nothing on GitHub.
         #[arg(long)]
         dry_run: bool,
+        /// Replay the stored questions for this PR instead of generating new
+        /// ones. Free, and keeps the questions stable while you iterate.
+        #[arg(long)]
+        reuse: bool,
     },
     /// PRs that went ready without a gate, plus open obligations.
     Status,
@@ -36,7 +40,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir()?;
     match cli.command {
-        Command::Ready { dry_run } => gate::Ready { dry_run }.run(&cwd),
+        Command::Ready { dry_run, reuse } => gate::Ready { dry_run, reuse }.run(&cwd),
         Command::Status => gate::status(&cwd),
     }
 }

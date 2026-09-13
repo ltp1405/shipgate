@@ -133,6 +133,10 @@ fn migrate(conn: &Connection) -> Result<()> {
 pub struct Gate {
     pub id: i64,
     pub repo: String,
+    /// The diff snapshot taken when the gate was created. `--reuse` replays
+    /// from this rather than re-deriving it, so the questions still line up
+    /// with the text they were written against.
+    pub diff: String,
     pub pr_number: u64,
     pub branch: String,
     pub base_ref: String,
@@ -160,6 +164,7 @@ pub struct Question {
     pub score: Option<f64>,
 }
 
+#[derive(Clone)]
 pub struct NewGate<'a> {
     pub repo: &'a str,
     pub pr_number: u64,
@@ -368,6 +373,7 @@ fn gate_from_row(row: &rusqlite::Row) -> rusqlite::Result<Gate> {
     Ok(Gate {
         id: row.get("id")?,
         repo: row.get("repo")?,
+        diff: row.get("diff")?,
         pr_number: row.get::<_, i64>("pr_number")? as u64,
         branch: row.get("branch")?,
         base_ref: row.get("base_ref")?,

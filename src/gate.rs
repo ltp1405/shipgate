@@ -59,6 +59,10 @@ pub fn passes(scores: &[f64]) -> bool {
 
 pub struct Ready {
     pub dry_run: bool,
+    /// Replay the stored gate instead of generating. Generation is the
+    /// expensive half, so without this every look at the quiz costs a model
+    /// call.
+    pub reuse: bool,
 }
 
 impl Ready {
@@ -80,6 +84,13 @@ impl Ready {
         } else {
             config::fallback_base(&dir, &repo, &cfg)?
         };
+
+        // Replaying uses the stored snapshot, so none of the HEAD-derived work
+        // below applies.
+        if self.reuse {
+            let conn = db::open()?;
+            return self.replay(&conn, &dir, &pr, &repo, &branch, &base_ref);
+        }
 
         let head_sha = git::rev_parse(&dir, "HEAD")?;
         if head_sha != pr.head_ref_oid {
@@ -126,34 +137,37 @@ impl Ready {
         println!();
 
         let conn = db::open()?;
-        let gate_id = db::upsert_gate(
-            &conn,
-            &db::NewGate {
-                repo: &repo,
-                pr_number: pr.number,
-                branch: &branch,
-                base_ref: &base_ref,
-                base_sha: &base_sha,
-                head_sha: &head_sha,
-                diff: &diff,
-                hunks_total: all_hunks.len() as i64,
-                hunks_ai: ai_hunks.len() as i64,
-                authorship: scope.mode.as_str(),
-                state: "generating",
-            },
-        )?;
+        // The gate row is written only once there are questions to put in it.
+        // Creating it up front means a process killed during generation — a
+        // closed pipe, a Ctrl-C — leaves an empty gate stuck in `generating`
+        // that every later run has to work around.
+        let new_gate = db::NewGate {
+            repo: &repo,
+            pr_number: pr.number,
+            branch: &branch,
+            base_ref: &base_ref,
+            base_sha: &base_sha,
+            head_sha: &head_sha,
+            diff: &diff,
+            hunks_total: all_hunks.len() as i64,
+            hunks_ai: ai_hunks.len() as i64,
+            authorship: scope.mode.as_str(),
+            state: "open",
+        };
 
         // §3 — trailers present but no AI hunks: nothing here is the model's.
         if ai_hunks.is_empty() && scope.mode == authorship::Mode::Trailers {
             println!("No AI-authored hunks in this PR ({} commits, none from Claude touched the diff).", scope.total_commits);
-            return self.finish_trivial(&conn, gate_id, &dir, &pr, "no AI-authored code");
+            let id = db::upsert_gate(&conn, &db::NewGate { state: "trivial", ..new_gate })?;
+            return self.finish_trivial(&conn, id, &dir, &pr, "no AI-authored code");
         }
 
         // §4 — triage before spending anything.
         match triage::assess(&dir, &base_sha, &head_sha, &ai_hunks)? {
             triage::Verdict::Skip(reason) => {
                 println!("Nothing worth quizzing: {reason}.");
-                return self.finish_trivial(&conn, gate_id, &dir, &pr, &reason);
+                let id = db::upsert_gate(&conn, &db::NewGate { state: "trivial", ..new_gate })?;
+                return self.finish_trivial(&conn, id, &dir, &pr, &reason);
             }
             triage::Verdict::Quiz => {}
         }
@@ -180,8 +194,12 @@ impl Ready {
         };
         let Some(generated) = generator.generate(&ctx)? else {
             println!("Generator declined: nothing worth asking.");
-            return self.finish_trivial(&conn, gate_id, &dir, &pr, "generator declined");
+            let id = db::upsert_gate(&conn, &db::NewGate { state: "trivial", ..new_gate })?;
+            return self.finish_trivial(&conn, id, &dir, &pr, "generator declined");
         };
+
+        // Generation succeeded, so the gate is worth recording.
+        let gate_id = db::upsert_gate(&conn, &new_gate)?;
 
         let new_qs: Vec<db::NewQuestion> = generated
             .iter()
@@ -195,7 +213,6 @@ impl Ready {
             })
             .collect();
         db::insert_questions(&conn, gate_id, &new_qs)?;
-        db::set_gate_state(&conn, gate_id, "open")?;
 
         let covered: HashSet<&str> = generated.iter().map(|g| g.anchor.as_str()).collect();
         let has_checkable = generated.iter().any(|g| g.kind == "checkable");
@@ -211,31 +228,8 @@ impl Ready {
         };
         println!("\n{coverage}\n");
 
-        let judge: Arc<dyn llm::Judge + Send + Sync> = match llm::cli::Cli::detect() {
-            Some(cli) => Arc::new(llm::judge::CliJudge { cli, diff: diff.clone() }),
-            None => Arc::new(llm::stub::StubJudge),
-        };
         let questions = db::questions_for(&conn, gate_id)?;
-
-        // The TUI needs a terminal. Piped stdin keeps `--dry-run` scriptable and
-        // is what the tests drive.
-        let scores = if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
-            tui::run(
-                &conn,
-                Arc::clone(&judge),
-                Arc::new(diff.clone()),
-                &ai_hunks,
-                questions.clone(),
-            )?
-        } else {
-            let mut scores = Vec::new();
-            for (i, q) in questions.iter().enumerate() {
-                let score =
-                    self.ask(&conn, judge.as_ref(), &diff, &ai_hunks, q, i + 1, questions.len())?;
-                scores.push(score);
-            }
-            scores
-        };
+        let scores = self.quiz(&conn, &diff, &ai_hunks, questions.clone())?;
 
         if !passes(&scores) {
             println!("\nNot cleared. Re-run when you want another go — disagreements are cheap.");
@@ -245,6 +239,102 @@ impl Ready {
         db::set_gate_state(&conn, gate_id, "cleared")?;
         let body = self.description(&conn, &dir, &pr, &questions, &coverage)?;
         self.submit(&dir, &pr, &body)
+    }
+
+    /// Re-run the quiz from the stored gate: same diff, same questions, no model
+    /// call. The rows are already persisted, so this is free.
+    fn replay(
+        &self,
+        conn: &Connection,
+        dir: &Path,
+        pr: &gh::Pr,
+        repo: &str,
+        branch: &str,
+        base_ref: &str,
+    ) -> Result<()> {
+        let Some(gate) = db::gate_for_pr(conn, repo, pr.number)? else {
+            bail!("no stored gate for {repo}#{} — run without --reuse first", pr.number);
+        };
+        let questions = db::questions_for(conn, gate.id)?;
+        if questions.is_empty() {
+            bail!(
+                "the stored gate for {repo}#{} has no questions (state: {}) — \
+                 run without --reuse first",
+                pr.number,
+                gate.state
+            );
+        }
+
+        // Rebuild the scope from the snapshot, not from HEAD. If the branch has
+        // moved since, the stored questions belong to the stored diff.
+        let parsed: Vec<git::Hunk> = git::parse_diff(&gate.diff)
+            .into_iter()
+            .filter(|h| !triage::is_generated(&h.file))
+            .collect();
+        let scope = authorship::resolve(dir, &gate.base_sha, &gate.head_sha)?;
+        let ai_hunks: Vec<git::Hunk> =
+            parsed.iter().filter(|h| scope.contains(h)).cloned().collect();
+
+        let coverage = Coverage {
+            questions: questions.len(),
+            hunks_ai: gate.hunks_ai,
+            hunks_total: gate.hunks_total,
+            hunks_covered: gate.hunks_covered,
+            authorship: gate.authorship.clone(),
+            has_checkable: gate.has_checkable,
+        };
+
+        println!(
+            "{repo}#{} · {branch} · base {base_ref} · replaying the stored gate ({})",
+            pr.number,
+            &gate.head_sha[..7.min(gate.head_sha.len())]
+        );
+        if gate.head_sha != git::rev_parse(dir, "HEAD")? {
+            eprintln!("note: HEAD has moved since this gate was created");
+        }
+        println!("\n{coverage}\n");
+
+        let scores = self.quiz(conn, &gate.diff, &ai_hunks, questions.clone())?;
+        if !passes(&scores) {
+            println!("\nNot cleared.");
+            return Ok(());
+        }
+        db::set_gate_state(conn, gate.id, "cleared")?;
+        let body = self.description(conn, dir, pr, &questions, &coverage)?;
+        self.submit(dir, pr, &body)
+    }
+
+    /// Shared by the fresh and replayed paths.
+    fn quiz(
+        &self,
+        conn: &Connection,
+        diff: &str,
+        ai_hunks: &[git::Hunk],
+        questions: Vec<db::Question>,
+    ) -> Result<Vec<f64>> {
+        let judge: Arc<dyn llm::Judge + Send + Sync> = match llm::cli::Cli::detect() {
+            Some(cli) => Arc::new(llm::judge::CliJudge { cli, diff: diff.to_string() }),
+            None => Arc::new(llm::stub::StubJudge),
+        };
+
+        // The TUI needs a terminal. Piped stdin keeps `--dry-run` scriptable.
+        if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+            tui::run(
+                conn,
+                Arc::clone(&judge),
+                Arc::new(diff.to_string()),
+                ai_hunks,
+                questions,
+            )
+        } else {
+            let mut scores = Vec::new();
+            for (i, q) in questions.iter().enumerate() {
+                scores.push(self.ask(
+                    conn, judge.as_ref(), diff, ai_hunks, q, i + 1, questions.len(),
+                )?);
+            }
+            Ok(scores)
+        }
     }
 
     fn ask(
