@@ -362,7 +362,14 @@ After submit: label, feedback, and the reference revealed on `demonstrates` or a
 
 ## 13. Cost
 
-**Measured, not estimated.** Model calls go through the Claude Code CLI (`claude -p`), which uses its own credentials — there is no Anthropic SDK for Rust, and an unverifiable raw-HTTP client had no place in the repo.
+**Measured, not estimated — but read the unit carefully.** Model calls go through the Claude Code CLI (`claude -p`), which uses its own credentials.
+
+The figures below come from the CLI's `total_cost_usd`, which reports `costBasis: "list"`: the **published API list price of the tokens consumed**. What that means for you depends on how Claude Code is authenticated:
+
+- **API key** (`ANTHROPIC_API_KEY`) — this is money billed, directly.
+- **OAuth / subscription** (an `oauthAccount` in `~/.claude.json`, no key set) — nothing is billed per call. The usage draws against plan limits, and the dollar figure is a *proxy for token consumption*, not an invoice.
+
+Either way the number is the right relative signal — it is proportional to tokens, so the comparisons below hold — but do not quote it as a bill without checking which case applies.
 
 Two real runs against this project's own PR, 19 AI-authored hunks:
 
@@ -373,14 +380,14 @@ Two real runs against this project's own PR, 19 AI-authored hunks:
 | `judge` (sonnet), per answered question | ~$0.05–0.15 |
 | answers killed by the §8 precheck | $0.00 |
 
-So a PR with six questions, all genuinely answered, lands around **$1.00–1.80**. An earlier draft of this section estimated $0.03–0.10 per PR from token counts alone. That was wrong by more than an order of magnitude, for two reasons it did not account for:
+So a PR with six questions, all genuinely answered, runs around **$1.00–1.80 of list-price token consumption**. An earlier draft estimated $0.03–0.10 per PR from token counts alone — wrong by more than an order of magnitude, for two reasons it did not account for:
 
 - **The CLI carries its own system prompt.** Every call pays ~12k cache-creation tokens before the diff is even sent. `--system-prompt` replaces the default but does not remove the overhead. A hello-world call costs $0.05.
 - **Opus for generation is most of the bill.** Judging on sonnet is comparatively cheap.
 
 Levers, in order of value: drop generation to sonnet (loses some of the §8 decorrelation, since the judge is already sonnet); ask for three questions rather than six; keep the precheck, which is free and killed five of six answers in the run above.
 
-Even at $1.50, this is a rounding error against the time a PR takes to review — but it is not free, and it scales with PR count, not with repo size. v1's Stop hook fired at every Claude Code turn end: 10–25 gates a day at this price would be $15–35 a day, which settles that placement question on cost alone.
+Against the time a PR takes to review, this is small either way — but it is not free, and it scales with PR count, not repo size. The comparison that matters is proportional, so it survives the billing question: v1's Stop hook fired at every Claude Code turn end, so 10–25 gates a day would consume **10–25× what the PR-ready gate does**. On an API key that is $15–35/day; on a subscription it is the difference between a gate you barely notice and one that exhausts your limits by lunchtime. Either way it settles the placement question independently of the ergonomics argument.
 
 ## 14. Build order
 
