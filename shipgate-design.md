@@ -170,6 +170,8 @@ Two effects, both intended. You can see when a pass means little. And a diff tha
 
 So there is **no line-count cap** on generation. A 2000-line diff gets the same three-to-six questions and a coverage line that reads `4/impossible`. The number is the feedback.
 
+**Generated files leave the quizzable set, not just the skip check.** Excluding them only when *every* changed file is generated is not enough: a lockfile riding along with real code still contributes hunks, and the generator will happily ask what the caller observes in `Cargo.lock`. That is precisely the noise §0 says drives people to the override. Filter generated hunks out before scoping, and report the count.
+
 Triage still skips entirely — before spending a token — when the diff is not code:
 
 - every changed file matches a lockfile / vendored / generated / minified pattern, or is `linguist-generated` in `.gitattributes`

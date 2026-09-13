@@ -120,9 +120,17 @@ impl Ready {
         let base_sha = git::merge_base(&dir, &base_ref, &head_sha)?;
 
         let diff = git::diff(&dir, &base_sha, &head_sha)?;
-        let all_hunks = git::parse_diff(&diff);
-        if all_hunks.is_empty() {
+        let parsed = git::parse_diff(&diff);
+        if parsed.is_empty() {
             bail!("no hunks between {base_ref} and HEAD — nothing to quiz");
+        }
+        let generated = parsed.iter().filter(|h| triage::is_generated(&h.file)).count();
+        let all_hunks: Vec<git::Hunk> = parsed
+            .into_iter()
+            .filter(|h| !triage::is_generated(&h.file))
+            .collect();
+        if all_hunks.is_empty() {
+            println!("Only generated or vendored files changed.");
         }
 
         // §3 — scope to AI-authored hunks.
@@ -133,13 +141,17 @@ impl Ready {
             .cloned()
             .collect();
 
-        println!(
+        print!(
             "{repo}#{} · {branch} · base {base_ref} · {} hunks, {} AI ({})",
             pr.number,
             all_hunks.len(),
             ai_hunks.len(),
             scope.mode.as_str()
         );
+        if generated > 0 {
+            print!(" · {generated} generated hunks excluded");
+        }
+        println!();
 
         let conn = db::open()?;
         let gate_id = db::upsert_gate(

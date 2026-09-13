@@ -24,7 +24,11 @@ const GENERATED_MARKERS: &[&str] = &[
 
 const GENERATED_DIRS: &[&str] = &["vendor/", "node_modules/", "dist/", "build/", "target/"];
 
-fn is_generated(path: &str) -> bool {
+/// Generated files are excluded from the quizzable hunk set, not just from the
+/// all-or-nothing skip below. A lockfile riding along with real code would
+/// otherwise supply hunks to quiz, and "what does the caller observe in
+/// Cargo.lock" is exactly the noise §0 says drives people to the override.
+pub fn is_generated(path: &str) -> bool {
     if GENERATED_MARKERS.iter().any(|m| path.ends_with(m)) {
         return true;
     }
