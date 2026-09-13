@@ -1,7 +1,7 @@
 //! Gate lifecycle, pass rule, coverage, and the PR description — the thing that
 //! makes `shipgate ready` worth running instead of `gh pr ready`.
 
-use crate::{authorship, config, db, gh, git, llm, triage};
+use crate::{authorship, config, context, db, gh, git, llm, triage};
 use anyhow::{bail, Context as _, Result};
 use rusqlite::Connection;
 use std::collections::HashSet;
@@ -54,35 +54,6 @@ pub fn passes(scores: &[f64]) -> bool {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let dropped = sorted[0];
     sorted[1..].iter().all(|s| *s >= 0.6) && dropped >= 0.3
-}
-
-/// §6 — test invocation, from static repo state only.
-fn find_test_command(dir: &Path) -> Option<String> {
-    let has = |p: &str| dir.join(p).exists();
-    if has("bin/rails") {
-        return Some("bundle exec rspec".into());
-    }
-    if has("Cargo.toml") {
-        return Some("cargo test".into());
-    }
-    if has("justfile") {
-        return Some("just test".into());
-    }
-    if has("Makefile") {
-        let mk = std::fs::read_to_string(dir.join("Makefile")).ok()?;
-        if mk.lines().any(|l| l.starts_with("test:")) {
-            return Some("make test".into());
-        }
-        return None;
-    }
-    if has("package.json") {
-        let pkg = std::fs::read_to_string(dir.join("package.json")).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&pkg).ok()?;
-        if v.get("scripts")?.get("test").is_some() {
-            return Some("npm test".into());
-        }
-    }
-    None
 }
 
 pub struct Ready {
@@ -186,16 +157,27 @@ impl Ready {
             triage::Verdict::Quiz => {}
         }
 
-        let test_command = find_test_command(&dir);
         let ctx = llm::Context {
             diff: &diff,
             hunks: &ai_hunks,
-            call_sites: Vec::new(), // step 2
-            test_command: test_command.clone(),
+            call_sites: context::call_sites(&dir, &ai_hunks)?,
+            test_command: context::test_command(&dir),
         };
+        if ctx.test_command.is_none() {
+            eprintln!("note: no test command found — no checkable question is possible");
+        }
 
-        let generator = llm::stub::StubGenerator;
-        let Some(generated) = llm::Generator::generate(&generator, &ctx)? else {
+        let generator: Box<dyn llm::Generator> = match llm::anthropic::Client::from_env()? {
+            Some(client) => {
+                println!("Generating questions…");
+                Box::new(llm::generate::ApiGenerator { client })
+            }
+            None => {
+                eprintln!("note: ANTHROPIC_API_KEY is not set — using stub questions");
+                Box::new(llm::stub::StubGenerator)
+            }
+        };
+        let Some(generated) = generator.generate(&ctx)? else {
             println!("Generator declined: nothing worth asking.");
             return self.finish_trivial(&conn, gate_id, &dir, &pr, "generator declined");
         };
@@ -228,12 +210,16 @@ impl Ready {
         };
         println!("\n{coverage}\n");
 
-        // Step 4 replaces this with the TUI. Plain stdin keeps step 1 honest.
-        let judge = llm::stub::StubJudge;
+        // Step 4 replaces this with the TUI. Plain stdin keeps it honest for now.
+        let judge: Box<dyn llm::Judge> = match llm::anthropic::Client::from_env()? {
+            Some(client) => Box::new(llm::judge::ApiJudge { client, diff: diff.clone() }),
+            None => Box::new(llm::stub::StubJudge),
+        };
+        let judge = judge.as_ref();
         let questions = db::questions_for(&conn, gate_id)?;
         let mut scores = Vec::new();
         for (i, q) in questions.iter().enumerate() {
-            let score = self.ask(&conn, &judge, &diff, &ai_hunks, q, i + 1, questions.len())?;
+            let score = self.ask(&conn, judge, &diff, &ai_hunks, q, i + 1, questions.len())?;
             scores.push(score);
         }
 

@@ -1,6 +1,9 @@
 //! Model calls. Step 1 ships stubs behind these traits so the gate flow can be
 //! proven end to end before any token is spent; §7 and §8 replace the bodies.
 
+pub mod anthropic;
+pub mod generate;
+pub mod judge;
 pub mod stub;
 
 use anyhow::Result;

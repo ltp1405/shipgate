@@ -234,11 +234,13 @@ System prompt, in short: produce three to six questions that cannot be answered 
 ]
 ```
 
-Strip ```` ```json ```` fences before parsing; on parse failure, retry once with the error appended.
+Responses use **structured outputs** (`output_config.format` with a JSON schema), which is stable on `claude-opus-5` and `claude-sonnet-5` and needs no beta header. The response is guaranteed to match the schema, so there are no code fences to strip and no parse-retry path — an earlier draft specified both. Schemas must set `additionalProperties: false` on every object and cannot use `minimum` / `maxLength`-style constraints; those return a 400.
+
+Anchors are still verified locally. A model can return an anchor string that matches no hunk, and an unverified one would silently corrupt coverage accounting and the §9 re-quiz path, so an unknown anchor is remapped onto a real hunk rather than trusted.
 
 ## 8. `judge`
 
-**Grade with a different model than the one that generated.** The generator writes the question, the reference *and* — under a single-model design — the grade. A wrong premise then sails through all three unchallenged, and dispute mode is the only escape, which requires you to spot it yourself. Different models do not eliminate correlated error (same family, overlapping training) but they decorrelate it materially, and the cost is zero: generate with the stronger model, judge with the cheaper one. Record `judge_model` on every attempt so a calibration shift is visible later rather than inferred.
+**Grade with a different model than the one that generated** — `claude-opus-5` generates, `claude-sonnet-5` judges. The generator writes the question, the reference *and* — under a single-model design — the grade. A wrong premise then sails through all three unchallenged, and dispute mode is the only escape, which requires you to spot it yourself. Different models do not eliminate correlated error (same family, overlapping training) but they decorrelate it materially, and the cost is zero: generate with the stronger model, judge with the cheaper one. Record `judge_model` on every attempt so a calibration shift is visible later rather than inferred.
 
 This is a mitigation, not a fix. The real defence is `checkable` questions, whose answers come from running code.
 
@@ -254,7 +256,7 @@ This is a mitigation, not a fix. The real defence is `checkable` questions, whos
 
 **Deterministic precheck, before any API call.** If the answer contains no literal token from the diff — identifier, line number, file name — label it `wrong` locally at zero cost. v1's rubric published its own answer key ("reward consequences, invariants, failure modes, facts not literally present"), and one sentence naming a rollback gap, an unvalidated input and a concurrency invariant scores well on a large fraction of diffs without reading any code. The judge prompt also carries the explicit negative: *score `wrong` if the answer would be equally true of an arbitrary code change.*
 
-**Borderline re-judge.** At `partial`, re-judge twice at temperature 0 and take the median label.
+**Borderline re-judge.** At `partial` — the label that decides a pass under drop-lowest — re-judge twice and take the median label. An earlier draft said "at temperature 0"; that is not available. `temperature`, `top_p` and `top_k` are **rejected with a 400** on Opus 5 and Sonnet 5, so the re-runs are plain repeats and the median is taken over the model's natural variance. A failed re-judge keeps the first label rather than failing the answer.
 
 **Pass rule: drop-lowest, not min.** All but one question at `partial` or better, and the dropped one no worse than `restates`.
 
@@ -270,7 +272,7 @@ Guards, because v1 made dispute-everything free:
 
 - at most one dispute per question, two per gate
 - the body must cite a file and line present in the diff, checked locally before the call
-- temperature 0, high bar: upheld only if the judge can state the concrete failing input or the contradicted line
+- a high bar, stated in the prompt rather than through sampling parameters, which these models reject: upheld only if the judge can state the concrete failing input or quote the contradicted line
 - **`code_bug` does not auto-pass.** The question goes to `deferred`, the gate can still clear, and an `obligations` row opens — settled by fixing the bug or withdrawing the claim before the next gate on that repo clears
 - `premise` / `reference` upheld drops the question and regenerates one replacement for the same anchor
 - not upheld is recorded as a scored attempt with the judge's feedback

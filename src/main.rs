@@ -1,5 +1,6 @@
 mod authorship;
 mod config;
+mod context;
 mod db;
 mod gate;
 mod gh;
