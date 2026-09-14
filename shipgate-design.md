@@ -387,21 +387,28 @@ The figures below come from the CLI's `total_cost_usd`, which reports `costBasis
 
 Either way the number is the right relative signal — it is proportional to tokens, so the comparisons below hold — but do not quote it as a bill without checking which case applies.
 
-Two real runs against this project's own PR, 19 AI-authored hunks:
+Measured against this project's own PR, ~22 AI-authored hunks, four questions:
 
 | | cost |
 |---|---|
-| `generate` (opus), cold | $0.91 |
-| `generate` (opus), warm | $0.32 |
-| `judge` (sonnet), per answered question | ~$0.05–0.15 |
+| `generate` on opus, cold / warm | $1.13 / $0.80 |
+| `generate` on sonnet | **$0.52** |
+| `judge` on haiku, per answered question | ~$0.05 |
 | answers killed by the §8 precheck | $0.00 |
 
-So a PR with six questions, all genuinely answered, runs around **$1.00–1.80 of list-price token consumption**. An earlier draft estimated $0.03–0.10 per PR from token counts alone — wrong by more than an order of magnitude, for two reasons it did not account for:
+The defaults are **sonnet to generate, haiku to judge** — roughly half what opus-and-sonnet cost, with question quality holding up in side-by-side runs. Set them in `~/.config/shipgate/config.toml`:
 
-- **The CLI carries its own system prompt.** Every call pays ~12k cache-creation tokens before the diff is even sent. `--system-prompt` replaces the default but does not remove the overhead. A hello-world call costs $0.05.
-- **Opus for generation is most of the bill.** Judging on sonnet is comparatively cheap.
+```toml
+[models]
+generate = "sonnet"
+judge = "haiku"
+```
 
-Levers, in order of value: drop generation to sonnet (loses some of the §8 decorrelation, since the judge is already sonnet); ask for three questions rather than six; keep the precheck, which is free and killed five of six answers in the run above.
+Whatever they are set to, the two must differ: §8 rests on the grader not being the model that wrote the question and the reference.
+
+An earlier draft of this section estimated $0.03–0.10 per PR from token counts alone. That was wrong by more than an order of magnitude, for two reasons it did not account for:
+
+Remaining levers, in order of value: ask for fewer questions; keep the precheck, which is free and killed five of six answers in the run above; and remember the bill scales with **PR count**, not repo size — a busy backlog is where this bites, not a large codebase.
 
 Against the time a PR takes to review, this is small either way — but it is not free, and it scales with PR count, not repo size. The comparison that matters is proportional, so it survives the billing question: v1's Stop hook fired at every Claude Code turn end, so 10–25 gates a day would consume **10–25× what the PR-ready gate does**. On an API key that is $15–35/day; on a subscription it is the difference between a gate you barely notice and one that exhausts your limits by lunchtime. Either way it settles the placement question independently of the ergonomics argument.
 
