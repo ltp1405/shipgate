@@ -21,6 +21,10 @@ pub struct Dash {
     pub rows: Vec<Row>,
     pub problems: Vec<String>,
     pub selected: usize,
+    /// Discovery is one `gh` round trip per repository, so a refresh blocks for
+    /// seconds. Without a frame drawn to say so the list just stops responding,
+    /// which reads as a hang rather than as work.
+    pub refreshing: bool,
 }
 
 /// What the dashboard hands back to the caller.
@@ -81,15 +85,23 @@ pub fn render(f: &mut Frame, d: &Dash, state: &mut ListState) {
         state,
     );
 
-    let status = if d.problems.is_empty() {
-        " enter quiz · r refresh · q quit ".to_string()
+    let keys = if d.refreshing {
+        "refreshing…"
     } else {
-        format!(" {} · enter quiz · r refresh · q quit ", d.problems[0])
+        "enter quiz · r refresh · q quit"
     };
+    // Reporting only `problems[0]` silently swallowed every other unreachable
+    // repository. Name the first and count the rest.
+    let status = match d.problems.len() {
+        0 => format!(" {keys} "),
+        1 => format!(" {} · {keys} ", d.problems[0]),
+        n => format!(" {} (+{} more) · {keys} ", d.problems[0], n - 1),
+    };
+    let bg = if d.refreshing { Color::Yellow } else { Color::Cyan };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             status,
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(Color::Black).bg(bg),
         ))),
         chunks[1],
     );
@@ -145,7 +157,11 @@ pub fn run(
                     state.select(Some(d.selected));
                 }
                 KeyCode::Char('r') => {
-                    let (rows, problems) = reload()?;
+                    d.refreshing = true;
+                    terminal.draw(|f| render(f, &d, &mut state))?;
+                    let reloaded = reload();
+                    d.refreshing = false;
+                    let (rows, problems) = reloaded?;
                     d.rows = rows;
                     d.problems = problems;
                     d.selected = d.selected.min(d.rows.len().saturating_sub(1));
@@ -165,4 +181,118 @@ pub fn run(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, buffer::Buffer};
+    use std::path::PathBuf;
+
+    fn draw(d: &Dash, w: u16, h: u16) -> Buffer {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut state = ListState::default();
+        state.select(Some(d.selected));
+        t.draw(|f| render(f, d, &mut state)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    /// The buffer is a grid, so a string can be split across cells; join each
+    /// row and search the rows.
+    fn rows(buf: &Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn dash(problems: Vec<String>, refreshing: bool) -> Dash {
+        Dash {
+            rows: vec![Row {
+                repo: "o/tapir".into(),
+                path: PathBuf::from("/tmp"),
+                pr_number: 42,
+                branch: "b".into(),
+                title: "Cache the thing".into(),
+                status: Status::Ungated,
+                coverage: None,
+            }],
+            problems,
+            selected: 0,
+            refreshing,
+        }
+    }
+
+    #[test]
+    fn the_list_names_the_repo_the_number_and_the_title() {
+        let text = rows(&draw(&dash(vec![], false), 100, 6)).join("\n");
+        assert!(text.contains("tapir"), "{text}");
+        assert!(text.contains("#42"), "{text}");
+        assert!(text.contains("Cache the thing"), "{text}");
+        assert!(text.contains("no gate"), "{text}");
+    }
+
+    #[test]
+    fn the_title_counts_what_is_waiting_on_you() {
+        let text = rows(&draw(&dash(vec![], false), 100, 6)).join("\n");
+        assert!(text.contains("1 waiting on you"), "{text}");
+    }
+
+    /// Discovery is one `gh` round trip per repository, so a refresh blocks for
+    /// seconds. Without this frame the list simply stops responding, which
+    /// reads as a hang.
+    #[test]
+    fn a_refresh_in_flight_says_so_instead_of_looking_hung() {
+        let text = rows(&draw(&dash(vec![], true), 100, 6)).join("\n");
+        assert!(text.contains("refreshing"), "{text}");
+    }
+
+    #[test]
+    fn the_keys_are_listed_when_nothing_is_in_flight() {
+        let text = rows(&draw(&dash(vec![], false), 100, 6)).join("\n");
+        assert!(text.contains("enter quiz"), "{text}");
+        assert!(!text.contains("refreshing"), "{text}");
+    }
+
+    /// Reporting only the first problem silently swallowed every other
+    /// unreachable repository.
+    #[test]
+    fn unreachable_repositories_beyond_the_first_are_counted_not_dropped() {
+        let d = dash(
+            vec!["a: boom".into(), "b: boom".into(), "c: boom".into()],
+            false,
+        );
+        let text = rows(&draw(&d, 100, 6)).join("\n");
+        assert!(text.contains("a: boom"), "{text}");
+        assert!(text.contains("+2 more"), "{text}");
+    }
+
+    #[test]
+    fn a_lone_problem_is_not_given_a_count() {
+        let text = rows(&draw(&dash(vec!["a: boom".into()], false), 100, 6)).join("\n");
+        assert!(text.contains("a: boom"), "{text}");
+        assert!(!text.contains("more"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_dashboard_renders_rather_than_panicking() {
+        let mut d = dash(vec![], false);
+        d.rows.clear();
+        let text = rows(&draw(&d, 100, 6)).join("\n");
+        assert!(text.contains("0 waiting on you"), "{text}");
+    }
+
+    #[test]
+    fn survives_a_cramped_terminal() {
+        draw(&dash(vec!["x: boom".into()], true), 20, 4);
+    }
+
+    #[test]
+    fn a_long_title_is_truncated_with_an_ellipsis() {
+        assert_eq!(truncate("abcdefghij", 5), "abcd…");
+        assert_eq!(truncate("abc", 5), "abc");
+    }
 }

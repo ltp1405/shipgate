@@ -608,7 +608,7 @@ pub fn dashboard() -> Result<()> {
     }
 
     let chosen = tui::dash::run(
-        tui::dash::Dash { rows, problems, selected: 0 },
+        tui::dash::Dash { rows, problems, selected: 0, refreshing: false },
         || {
             let conn = db::open()?;
             dash::collect(&conn)
