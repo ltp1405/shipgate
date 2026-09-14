@@ -7,6 +7,9 @@ use serde::Deserialize;
 pub struct CliJudge {
     pub cli: cli::Cli,
     pub diff: String,
+    /// The PR title and commit subjects. The reviewer can read these, so an
+    /// answer that merely echoes them demonstrates nothing.
+    pub restatement_sources: Vec<String>,
 }
 
 const SYSTEM: &str = "\
@@ -27,11 +30,15 @@ Labels:
                  invariants, failure modes, or facts not literally present in \
                  the diff.
 
-Two rules that override the rest:
+Three rules that override the rest:
 
 - Score `wrong` if the answer would be equally true of an arbitrary code change. \
   Generic statements about rollbacks, validation, or concurrency that name \
   nothing specific to THIS diff are not answers.
+- Score `wrong` if the answer only restates the change's stated purpose. The \
+  reviewer was given the title and the commit subjects; repeating them back is \
+  not understanding. An answer about intent must say something those do not, and \
+  must connect to what the code actually does.
 - Length is not quality. One sentence naming the consequence and pointing at a \
   line is a complete answer and should score `demonstrates`. Do not reward \
   volume, hedging, or restatement of the question.";
@@ -95,8 +102,20 @@ fn parse_label(s: &str) -> Label {
 
 impl CliJudge {
     fn grade_once(&self, question: &str, answer: &str) -> Result<Graded> {
+        let sources = if self.restatement_sources.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n# The reviewer can already read all of this\n\n{}",
+                self.restatement_sources
+                    .iter()
+                    .map(|s| format!("- {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
         let system = format!(
-            "{SYSTEM}\n\n# Reply with exactly this shape\n\n{ANSWER_SHAPE}\n\n# The diff\n\n{}",
+            "{SYSTEM}\n\n# Reply with exactly this shape\n\n{ANSWER_SHAPE}{sources}\n\n# The diff\n\n{}",
             self.diff
         );
         let user = format!("# Question\n\n{question}\n\n# The reviewer's answer\n\n{answer}");

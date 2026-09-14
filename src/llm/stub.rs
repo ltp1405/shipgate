@@ -22,6 +22,22 @@ impl Generator for StubGenerator {
 
         let mut out = vec![
             Generated {
+                kind: "intent".into(),
+                file: pick(0).file.clone(),
+                anchor: pick(0).anchor.clone(),
+                text: format!(
+                    "{} files changed together here. What single change of intent \
+                     required all of them, that you could not get from the title?",
+                    ctx.all_files.len().max(1)
+                ),
+                reference: "[stand-in] not a real reference answer".into(),
+                hints: vec![
+                    "Look at what the files have in common.".into(),
+                    "Start from the file with the most added lines.".into(),
+                    "[stand-in] half the answer".into(),
+                ],
+            },
+            Generated {
                 kind: "prediction".into(),
                 file: pick(0).file.clone(),
                 anchor: pick(0).anchor.clone(),
@@ -29,11 +45,11 @@ impl Generator for StubGenerator {
                     "In {}, what does the caller observe if this hunk's happy path does not run?",
                     pick(0).file
                 ),
-                reference: "[stub] replaced in step 2".into(),
+                reference: "[stand-in] not a real reference answer".into(),
                 hints: vec![
                     "Look at how control leaves the block.".into(),
                     "Check the error branch.".into(),
-                    "[stub] half the answer".into(),
+                    "[stand-in] half the answer".into(),
                 ],
             },
             Generated {
@@ -41,11 +57,11 @@ impl Generator for StubGenerator {
                 file: pick(1).file.clone(),
                 anchor: pick(1).anchor.clone(),
                 text: format!("What input to {} breaks this change?", pick(1).file),
-                reference: "[stub] replaced in step 2".into(),
+                reference: "[stand-in] not a real reference answer".into(),
                 hints: vec![
                     "Consider the empty case.".into(),
                     "Check the boundary values.".into(),
-                    "[stub] half the answer".into(),
+                    "[stand-in] half the answer".into(),
                 ],
             },
         ];
@@ -57,11 +73,11 @@ impl Generator for StubGenerator {
                 file: pick(0).file.clone(),
                 anchor: pick(0).anchor.clone(),
                 text: format!("Run `{cmd}`. What does it report about this change?"),
-                reference: "[stub] replaced in step 2".into(),
+                reference: "[stand-in] not a real reference answer".into(),
                 hints: vec![
                     "Run it and read the output.".into(),
                     format!("`{cmd}` covers the changed paths."),
-                    "[stub] half the answer".into(),
+                    "[stand-in] half the answer".into(),
                 ],
             });
         }

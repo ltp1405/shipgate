@@ -9,25 +9,37 @@ pub struct CliGenerator {
 }
 
 const SYSTEM: &str = "\
-You write review questions for a pull request. You see only the changed hunks \
-and static repository context — never the session that produced the code, so do \
-not assume any reasoning behind it.
+You write review questions for a pull request. You see the changed hunks, the \
+change's stated purpose, and static repository context — never the session that \
+produced the code, so do not assume any reasoning behind it.
 
-Produce three to six questions that cannot be answered by paraphrasing the code. \
-Prefer, in this order:
+Produce exactly four questions that cannot be answered by paraphrasing anything \
+you were given.
 
-1. checkable — the reviewer obtains the answer by RUNNING something. Use only a \
-   command given to you in the context. If no command was given, do not invent \
-   one and do not use this kind.
-2. prediction — \"if X were Y, what does the caller at this line observe\".
-3. adversarial — \"what input breaks this\".
-4. cross_cutting — \"what at <this call site> assumes this\". Use ONLY where a \
-   call site appears in the context. Never invent a caller.
-5. justification — \"why this over the obvious alternative\".
+The FIRST question must be `intent`, and there must be exactly one. It tests \
+whether the reviewer understands what this change is *for* — something they \
+cannot answer by reading one hunk, and cannot answer from the title or a commit \
+subject, because those are handed to them too. Make it require relating at least \
+two files or hunks. Good shapes:
+  - these files changed together; what single change of intent required all of them
+  - which of these changes could be dropped and still deliver the goal
+  - what would you expect this change to have touched that it deliberately did not
+  - what can a caller do now that they could not before
+Never ask 'what does this PR do' or 'summarise this change'.
+
+The remaining three come from, in this order:
+  checkable — the reviewer obtains the answer by RUNNING something. Use only a \
+    command given to you in the context. If none was given, do not use this kind.
+  prediction — 'if X were Y, what does the caller at this line observe'.
+  adversarial — 'what input breaks this'.
+  cross_cutting — 'what at <this call site> assumes this'. Use ONLY where a call \
+    site appears in the context. Never invent a caller.
+  justification — 'why this over the obvious alternative'.
 
 Never ask what a function does. Demand a specific value, branch, or call site — \
-never \"what could go wrong\". Anchor each question to the hunk it came from by \
-copying that hunk's anchor string verbatim.
+never 'what could go wrong'. Anchor each question to the hunk it came from by \
+copying that hunk's anchor string verbatim; for the intent question, use the \
+anchor of whichever hunk it leans on most.
 
 For each question give a reference answer and three hints of increasing strength: \
 a nudge, a pointer to specific lines, then half the answer.
@@ -62,7 +74,7 @@ const SHAPE: &str = r#"{
   "reason": "",
   "questions": [
     {
-      "kind": "checkable | prediction | adversarial | cross_cutting | justification",
+      "kind": "intent | checkable | prediction | adversarial | cross_cutting | justification",
       "file": "path/to/file",
       "anchor": "the anchor string copied verbatim from the hunk",
       "text": "the question",
@@ -84,6 +96,19 @@ impl Generator for CliGenerator {
     fn generate(&self, ctx: &Context) -> Result<Option<Vec<Generated>>> {
         let mut user = String::from("# AI-authored hunks\n\n");
         user.push_str(&render_hunks(ctx));
+
+        user.push_str(&format!("# What this change says it is for\n\n{}\n", ctx.pr_title));
+        if !ctx.commit_subjects.is_empty() {
+            for c in &ctx.commit_subjects {
+                user.push_str(&format!("- {c}\n"));
+            }
+        }
+        user.push('\n');
+
+        user.push_str(&format!(
+            "# Every file this change touches\n\n{}\n\n",
+            ctx.all_files.join("\n")
+        ));
 
         match &ctx.test_command {
             Some(cmd) => user.push_str(&format!(

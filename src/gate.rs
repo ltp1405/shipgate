@@ -16,6 +16,7 @@ pub struct Coverage {
     pub hunks_covered: i64,
     pub authorship: String,
     pub has_checkable: bool,
+    pub has_intent: bool,
 }
 
 impl std::fmt::Display for Coverage {
@@ -33,6 +34,9 @@ impl std::fmt::Display for Coverage {
         }
         if !self.has_checkable {
             write!(f, " · no checkable")?;
+        }
+        if !self.has_intent {
+            write!(f, " · NO INTENT QUESTION")?;
         }
         Ok(())
     }
@@ -203,6 +207,9 @@ impl Ready {
             hunks: &ai_hunks,
             call_sites: context::call_sites(&dir, &ai_hunks)?,
             test_command: context::test_command(&dir),
+            pr_title: pr.title.clone(),
+            commit_subjects: gh::pr_commits(&dir, pr.number).unwrap_or_default(),
+            all_files: git::changed_files(&dir, &base_sha, &head_sha)?,
         };
         if ctx.test_command.is_none() {
             eprintln!("note: no test command found — no checkable question is possible");
@@ -239,6 +246,10 @@ impl Ready {
 
         let covered: HashSet<&str> = generated.iter().map(|g| g.anchor.as_str()).collect();
         let has_checkable = generated.iter().any(|g| g.kind == "checkable");
+        let has_intent = generated.iter().any(|g| g.kind == "intent");
+        if !has_intent {
+            eprintln!("warning: the generator returned no intent question");
+        }
         db::set_gate_coverage(&conn, gate_id, covered.len() as i64, has_checkable)?;
 
         let coverage = Coverage {
@@ -248,11 +259,18 @@ impl Ready {
             hunks_covered: covered.len() as i64,
             authorship: scope.mode.as_str().to_string(),
             has_checkable,
+            has_intent,
         };
         println!("\n{coverage}\n");
 
         let questions = db::questions_for(&conn, gate_id)?;
-        let scores = self.quiz(&conn, &diff, &ai_hunks, questions.clone())?;
+        let scores = self.quiz(
+            &conn,
+            &diff,
+            &ai_hunks,
+            questions.clone(),
+            ctx.restatement_sources(),
+        )?;
 
         if !passes(&scores) {
             println!("\nNot cleared. Re-run when you want another go — disagreements are cheap.");
@@ -321,6 +339,7 @@ impl Ready {
             hunks_covered: gate.hunks_covered,
             authorship: gate.authorship.clone(),
             has_checkable: gate.has_checkable,
+            has_intent: questions.iter().any(|q| q.kind == "intent"),
         };
 
         println!(
@@ -333,7 +352,9 @@ impl Ready {
         }
         println!("\n{coverage}\n");
 
-        let scores = self.quiz(conn, &gate.diff, &ai_hunks, questions.clone())?;
+        let mut sources = vec![pr.title.clone()];
+        sources.extend(gh::pr_commits(dir, pr.number).unwrap_or_default());
+        let scores = self.quiz(conn, &gate.diff, &ai_hunks, questions.clone(), sources)?;
         if !passes(&scores) {
             println!("\nNot cleared.");
             return Ok(());
@@ -344,12 +365,14 @@ impl Ready {
     }
 
     /// Shared by the fresh and replayed paths.
+    #[allow(clippy::too_many_arguments)]
     fn quiz(
         &self,
         conn: &Connection,
         diff: &str,
         ai_hunks: &[git::Hunk],
         questions: Vec<db::Question>,
+        restatement_sources: Vec<String>,
     ) -> Result<Vec<f64>> {
         let done = questions.iter().filter(|q| q.status == "passed").count();
         if done > 0 {
@@ -357,7 +380,11 @@ impl Ready {
         }
 
         let judge: Arc<dyn llm::Judge + Send + Sync> = match self.backend() {
-            Some(cli) => Arc::new(llm::judge::CliJudge { cli, diff: diff.to_string() }),
+            Some(cli) => Arc::new(llm::judge::CliJudge {
+                cli,
+                diff: diff.to_string(),
+                restatement_sources,
+            }),
             None => Arc::new(llm::stub::StubJudge::default()),
         };
 
@@ -472,7 +499,7 @@ impl Ready {
 
         let mut body = String::new();
         body.push_str("## What this changes\n\n");
-        match answer_for("justification") {
+        match answer_for("intent").or_else(|| answer_for("justification")) {
             Some(a) => body.push_str(&format!("{a}\n")),
             None => {
                 let commits = gh::pr_commits(dir, pr.number).unwrap_or_default();
@@ -551,6 +578,9 @@ pub fn status(cwd: &Path) -> Result<()> {
                     hunks_covered: g.hunks_covered,
                     authorship: g.authorship.clone(),
                     has_checkable: g.has_checkable,
+                    has_intent: db::questions_for(&conn, g.id)?
+                        .iter()
+                        .any(|q| q.kind == "intent"),
                 };
                 println!("{repo}#{:<5} {:<10} {cov}", pr.number, g.state);
             }

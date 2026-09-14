@@ -25,6 +25,25 @@ pub struct Context<'a> {
     pub call_sites: Vec<String>,
     /// Test invocation, if one was found. `checkable` questions need it.
     pub test_command: Option<String>,
+    /// What the change claims to be for. Without this the generator can only
+    /// see individual hunks, so it can only ask about individual hunks — and a
+    /// reviewer can answer every one and still not know why the PR exists.
+    pub pr_title: String,
+    pub commit_subjects: Vec<String>,
+    /// Every changed path, including files outside the AI scope: coherence is a
+    /// property of the whole change, not of the part a model wrote.
+    pub all_files: Vec<String>,
+}
+
+impl Context<'_> {
+    /// Text a reviewer could crib an "intent" answer from without reading the
+    /// diff. The judge is shown these so it can refuse a restatement.
+    pub fn restatement_sources(&self) -> Vec<String> {
+        let mut v = vec![self.pr_title.clone()];
+        v.extend(self.commit_subjects.iter().cloned());
+        v.retain(|s| !s.trim().is_empty());
+        v
+    }
 }
 
 pub trait Generator {
