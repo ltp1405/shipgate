@@ -207,17 +207,31 @@ v1 sent the diff alone. Two of its five question kinds are not answerable that w
 
 `context.rs` gathers, from static repo state only:
 
+0. **What the change says it is for** — the PR title, the commit subjects, and every changed path, including files outside the AI scope. Without these the generator can only see individual hunks, so it can only ask about individual hunks. Coherence is a property of the whole change, not of the part a model wrote.
+
 1. **Call sites.** For each symbol whose signature or semantics changed, `git grep -n` the identifier, with ±3 lines of context. A few hundred tokens; makes `cross_cutting` real.
 2. **Test invocation.** Parsed from `Makefile` / `package.json` / `Cargo.toml` / `justfile` / `bin/rails`, plus the test files touching the changed paths. Makes `checkable` real.
 3. **Before-content** of each changed file under ~200 lines.
 
 None of it is the coding session's transcript. The generator never sees the reasoning that produced the code, so it cannot inherit its mistakes.
 
+Commit subjects are the one debatable inclusion, being artifacts of that session. They are admitted because they are committed, reviewable text in the repository rather than raw session reasoning — but admitting them means the reviewer can read them too, which is exactly why §8 must refuse an answer that only echoes them.
+
 ## 7. `generate`
 
 Input is the **AI-authored hunks** plus context, not the whole diff.
 
-System prompt, in short: produce three to six questions that cannot be answered by paraphrasing the code. Prefer, in order: **checkable** (the reviewer obtains the answer by *running* something — use only the commands supplied), **prediction** ("if X were Y, what does the caller at this line observe"), **adversarial** ("what input breaks this"), **cross_cutting** ("what at the given call sites assumes this") — only where a call site was supplied — **justification** ("why this over the obvious alternative"). Never ask what a function does. Demand a specific value, branch or call site, never "what could go wrong". For each, give a reference answer and three hints of increasing strength. Return JSON only, or `{"skip": true, "reason": "…"}`.
+**Exactly four questions, and the first is always `intent`.**
+
+An earlier version asked for three to six, ranked `checkable` first and `justification` last, and fed the generator nothing but the AI-authored hunks. Every question it produced was local mechanism — trace this branch, name the failing test. A reviewer could answer all of them correctly and still not say what the change was *for*. That is the more damaging gap of the two: mechanism can be re-derived from the code later, but a change whose purpose nobody knows is the one that rots.
+
+**intent** must relate at least two files or hunks. Shapes that work: what single change of intent required all these files; which of these changes could be dropped and still deliver the goal; what would you expect this to have touched that it deliberately did not; what can a caller do now that they could not before. Never "what does this PR do" or "summarise this change" — those are paraphrase, which this section exists to prevent.
+
+The remaining three come from, in order: **checkable** (the reviewer obtains the answer by *running* something — only a command actually supplied), **prediction** ("if X were Y, what does the caller at this line observe"), **adversarial** ("what input breaks this"), **cross_cutting** ("what at the given call sites assumes this", only where a call site was supplied), **justification** ("why this over the obvious alternative").
+
+Never ask what a function does. Demand a specific value, branch or call site, never "what could go wrong". For each, give a reference answer and three hints of increasing strength. Return JSON only, or `{"skip": true, "reason": "…"}`.
+
+If the generator returns no intent question, the coverage line says so rather than passing quietly.
 
 **At least one `checkable` per gate, where a test command exists.** This is the structural defence against the shared blind spot in §8: a question you settle by running `bin/rails runner` or `cargo test` has a ground truth outside the model. Where `context.rs` found no runnable command, or the change has no observable behaviour (pure refactor), the generator may return none — and the gate prints `no checkable` in its coverage line. Requiring one unconditionally would only make the model invent a command, which is the exact failure being defended against.
 
@@ -255,6 +269,8 @@ This is a mitigation, not a fix. The real defence is `checkable` questions, whos
 ```
 
 `wrong` → 0.0, `restates` → 0.3, `partial` → 0.6, `demonstrates` → 0.9.
+
+**Refuse a restatement.** The judge is shown the PR title and commit subjects under the heading *the reviewer can already read all of this*, and scores `wrong` when an answer merely echoes them. Without this the intent question collapses back into paraphrase, since the reviewer is handed the same text the generator was.
 
 **Deterministic precheck, before any API call.** If the answer contains no literal token from the diff — identifier, line number, file name — label it `wrong` locally at zero cost. v1's rubric published its own answer key ("reward consequences, invariants, failure modes, facts not literally present"), and one sentence naming a rollback gap, an unvalidated input and a concurrency invariant scores well on a large fraction of diffs without reading any code. The judge prompt also carries the explicit negative: *score `wrong` if the answer would be equally true of an arbitrary code change.*
 
@@ -298,7 +314,7 @@ On clear, assemble a description from **your** answers — not the reference ans
 
 ```markdown
 ## What this changes
-<from the justification answer, or gh's commit list if none>
+<from the intent answer — falling back to justification, then gh's commit list>
 
 ## Behaviour worth knowing
 <the prediction and adversarial answers, lightly edited>
