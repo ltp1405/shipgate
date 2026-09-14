@@ -104,6 +104,11 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_obligations_g  ON obligations(gate_id);
     CREATE INDEX idx_gates_state    ON gates(state);
     "#,
+    // 2 — the dashboard has no working directory to infer from, so a gate has
+    // to carry the path it was created in.
+    r#"
+    ALTER TABLE gates ADD COLUMN path TEXT NOT NULL DEFAULT '';
+    "#,
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -133,6 +138,9 @@ fn migrate(conn: &Connection) -> Result<()> {
 pub struct Gate {
     pub id: i64,
     pub repo: String,
+    /// Working tree this gate was created in. The dashboard runs git and gh
+    /// there; without it a gate is unreachable from outside its own repo.
+    pub path: String,
     /// The diff snapshot taken when the gate was created. `--reuse` replays
     /// from this rather than re-deriving it, so the questions still line up
     /// with the text they were written against.
@@ -167,6 +175,7 @@ pub struct Question {
 #[derive(Clone)]
 pub struct NewGate<'a> {
     pub repo: &'a str,
+    pub path: &'a str,
     pub pr_number: u64,
     pub branch: &'a str,
     pub base_ref: &'a str,
@@ -194,12 +203,13 @@ pub fn upsert_gate(conn: &Connection, g: &NewGate) -> Result<i64> {
         )?;
         conn.execute(
             "INSERT INTO gates
-               (repo, pr_number, branch, base_ref, base_sha, head_sha, diff,
+               (repo, path, pr_number, branch, base_ref, base_sha, head_sha, diff,
                 hunks_total, hunks_ai, hunks_covered, authorship, state,
                 created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11,?12,?12)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12,?13,?13)",
             params![
                 g.repo,
+                g.path,
                 g.pr_number as i64,
                 g.branch,
                 g.base_ref,
@@ -373,6 +383,7 @@ fn gate_from_row(row: &rusqlite::Row) -> rusqlite::Result<Gate> {
     Ok(Gate {
         id: row.get("id")?,
         repo: row.get("repo")?,
+        path: row.get("path")?,
         diff: row.get("diff")?,
         pr_number: row.get::<_, i64>("pr_number")? as u64,
         branch: row.get("branch")?,
@@ -410,6 +421,27 @@ pub fn attempt_count(conn: &Connection, gate_id: i64) -> Result<i64> {
         params![gate_id],
         |r| r.get(0),
     )?)
+}
+
+/// Every gate, newest first, for the dashboard.
+pub fn all_gates(conn: &Connection) -> Result<Vec<Gate>> {
+    let mut stmt = conn.prepare("SELECT * FROM gates ORDER BY updated_at DESC")?;
+    let rows = stmt.query_map([], gate_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Drop gates whose PR is no longer open. Without this the dashboard only ever
+/// grows, which is what turned v1's debt tab into a list nobody opened.
+pub fn prune_closed(conn: &Connection, repo: &str, open_prs: &[u64]) -> Result<usize> {
+    let gates = gates_for_repo(conn, repo)?;
+    let mut removed = 0;
+    for g in gates {
+        if !open_prs.contains(&g.pr_number) {
+            conn.execute("DELETE FROM gates WHERE id = ?1", params![g.id])?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 pub struct Obligation {
@@ -481,6 +513,7 @@ mod tests {
             conn,
             &NewGate {
                 repo: "o/r",
+                path: "/tmp/o-r",
                 pr_number: 7,
                 branch: "feature/x",
                 base_ref: "origin/develop",

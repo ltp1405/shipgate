@@ -1,6 +1,7 @@
 mod authorship;
 mod config;
 mod context;
+mod dash;
 mod db;
 mod gate;
 mod gh;
@@ -17,11 +18,14 @@ use clap::{Parser, Subcommand};
 #[command(name = "shipgate", version, about)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Every PR waiting on you, across every watched repository. This is what
+    /// runs when shipgate is invoked with no arguments.
+    Dash,
     /// Quiz the AI-authored parts of this PR, then write the description and mark it ready.
     Ready {
         /// Run the quiz but touch nothing on GitHub.
@@ -46,7 +50,8 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir()?;
-    match cli.command {
+    match cli.command.unwrap_or(Command::Dash) {
+        Command::Dash => gate::dashboard(),
         Command::Ready { dry_run, reuse, offline, force } => {
             gate::Ready { dry_run, reuse, offline, force }.run(&cwd)
         }

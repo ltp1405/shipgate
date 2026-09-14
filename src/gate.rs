@@ -1,7 +1,7 @@
 //! Gate lifecycle, pass rule, coverage, and the PR description — the thing that
 //! makes `shipgate ready` worth running instead of `gh pr ready`.
 
-use crate::{authorship, config, context, db, gh, git, llm, triage, tui};
+use crate::{authorship, config, context, dash, db, gh, git, llm, triage, tui};
 use anyhow::{bail, Context as _, Result};
 use rusqlite::Connection;
 use std::collections::HashSet;
@@ -173,6 +173,7 @@ impl Ready {
         // that every later run has to work around.
         let new_gate = db::NewGate {
             repo: &repo,
+            path: &dir.to_string_lossy(),
             pr_number: pr.number,
             branch: &branch,
             base_ref: &base_ref,
@@ -560,6 +561,73 @@ impl Ready {
         println!("#{} ready · {}", pr.number, pr.url);
         Ok(())
     }
+}
+
+/// The dashboard. Unlike every other entry point this has no working directory
+/// to infer from, so each row carries the path it belongs to and the quiz runs
+/// there.
+pub fn dashboard() -> Result<()> {
+    let conn = db::open()?;
+    eprintln!("Looking for open pull requests…");
+    let (rows, problems) = dash::collect(&conn)?;
+
+    if rows.is_empty() {
+        println!("No open pull requests found.");
+        for p in &problems {
+            eprintln!("  {p}");
+        }
+        if config::load().watch.is_empty() {
+            let path = config::config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "~/.config/shipgate/config.toml".into());
+            println!(
+                "\nNothing is being watched yet. Add a repository to {path}:\n\n                 [[watch]]\npath = \"~/workspace/your-repo\""
+            );
+        }
+        return Ok(());
+    }
+
+    // No terminal: print the list rather than failing to start a TUI. Keeps the
+    // dashboard usable from a script or a pipe.
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        for r in &rows {
+            let mark = if r.status.needs_you() { "*" } else { " " };
+            println!(
+                "{mark} {:<16} #{:<6} {:<40} {:<15} {}",
+                r.repo.rsplit('/').next().unwrap_or(&r.repo),
+                r.pr_number,
+                r.title.chars().take(40).collect::<String>(),
+                r.status.label(),
+                r.coverage.clone().unwrap_or_default(),
+            );
+        }
+        for p in &problems {
+            eprintln!("warning: {p}");
+        }
+        return Ok(());
+    }
+
+    let chosen = tui::dash::run(
+        tui::dash::Dash { rows, problems, selected: 0 },
+        || {
+            let conn = db::open()?;
+            dash::collect(&conn)
+        },
+    )?;
+
+    let tui::dash::Chosen::Quiz(row) = chosen else {
+        return Ok(());
+    };
+
+    // An existing gate is replayed; a PR with none is quizzed from scratch.
+    let reuse = !matches!(row.status, dash::Status::Ungated);
+    Ready {
+        dry_run: false,
+        reuse,
+        offline: false,
+        force: false,
+    }
+    .run(&row.path)
 }
 
 /// §11 — the soft teeth. Lists PRs that went ready without a gate.

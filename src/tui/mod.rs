@@ -5,6 +5,7 @@
 //! the code is days old by the time a PR is ready, and an open-book quiz without
 //! the book is a memory test on code you wrote last week.
 
+pub mod dash;
 mod quiz;
 
 use crate::{db, git, llm};
@@ -779,7 +780,7 @@ diff --git a/sync.rs b/sync.rs
         let gate = db::upsert_gate(
             &conn,
             &db::NewGate {
-                repo: "o/r", pr_number: 1, branch: "b", base_ref: "origin/main",
+                repo: "o/r", path: "/tmp/o-r", pr_number: 1, branch: "b", base_ref: "origin/main",
                 base_sha: "a", head_sha: "b", diff: DIFF,
                 hunks_total: 1, hunks_ai: 1, authorship: "trailers", state: "open",
             },

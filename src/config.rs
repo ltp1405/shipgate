@@ -12,6 +12,27 @@ pub struct Config {
     pub repo: HashMap<String, RepoConfig>,
     #[serde(default)]
     pub models: Models,
+    /// Repositories the dashboard watches for PRs you have not gated yet.
+    /// Gates already carry their own path, so this only matters for discovery.
+    #[serde(default)]
+    pub watch: Vec<Watch>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Watch {
+    pub path: String,
+}
+
+impl Watch {
+    /// Expand a leading `~`, since a config file is written by hand.
+    pub fn expanded(&self) -> std::path::PathBuf {
+        match self.path.strip_prefix("~/") {
+            Some(rest) => directories::UserDirs::new()
+                .map(|d| d.home_dir().join(rest))
+                .unwrap_or_else(|| std::path::PathBuf::from(&self.path)),
+            None => std::path::PathBuf::from(&self.path),
+        }
+    }
 }
 
 /// Which model writes the questions and which grades them.
@@ -50,15 +71,52 @@ pub struct RepoConfig {
     pub base: Option<String>,
 }
 
+/// Where the config lives.
+///
+/// `directories` returns the platform-native directory, which on macOS is
+/// `~/Library/Application Support/shipgate` — not where anyone looks for a
+/// command-line tool's config. XDG first, then `~/.config`, then the
+/// platform default, and an existing file wins over a merely-possible one.
+pub fn config_path() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.trim().is_empty() {
+            candidates.push(std::path::PathBuf::from(xdg).join("shipgate/config.toml"));
+        }
+    }
+    if let Some(dirs) = directories::UserDirs::new() {
+        candidates.push(dirs.home_dir().join(".config/shipgate/config.toml"));
+    }
+    if let Some(dirs) = directories::ProjectDirs::from("", "", "shipgate") {
+        candidates.push(dirs.config_dir().join("config.toml"));
+    }
+
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
 pub fn load() -> Config {
-    let Some(dirs) = directories::ProjectDirs::from("", "", "shipgate") else {
+    let dirs = ();
+    let _ = dirs;
+    let Some(path) = config_path() else {
         return Config::default();
     };
-    let path = dirs.config_dir().join("config.toml");
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = std::fs::read_to_string(&path) else {
         return Config::default();
     };
-    toml::from_str(&text).unwrap_or_default()
+    match toml::from_str(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            // Silently falling back to defaults would hide a typo in a file the
+            // user wrote by hand.
+            eprintln!("warning: {} is not valid TOML: {e}", path.display());
+            Config::default()
+        }
+    }
 }
 
 /// Resolution order: the PR's own base (authoritative, handled by the caller),
