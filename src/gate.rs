@@ -218,7 +218,10 @@ impl Ready {
         let generator: Box<dyn llm::Generator> = match self.backend() {
             Some(cli) => {
                 println!("Generating questions…");
-                Box::new(llm::generate::CliGenerator { cli })
+                Box::new(llm::generate::CliGenerator {
+                    cli,
+                    model: cfg.models.generate.clone(),
+                })
             }
             None => Box::new(llm::stub::StubGenerator),
         };
@@ -382,6 +385,7 @@ impl Ready {
         let judge: Arc<dyn llm::Judge + Send + Sync> = match self.backend() {
             Some(cli) => Arc::new(llm::judge::CliJudge {
                 cli,
+                model: config::load().models.judge,
                 diff: diff.to_string(),
                 restatement_sources,
             }),

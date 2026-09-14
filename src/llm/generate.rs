@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 pub struct CliGenerator {
     pub cli: cli::Cli,
+    pub model: String,
 }
 
 const SYSTEM: &str = "\
@@ -131,11 +132,11 @@ impl Generator for CliGenerator {
         let system = format!("{SYSTEM}\n\n# Reply with exactly this shape\n\n{SHAPE}");
         let (value, cost) = self
             .cli
-            .complete_json(cli::GENERATE_MODEL, &system, &user)?;
+            .complete_json(&self.model, &system, &user)?;
         let out: Output = serde_json::from_value(value)
             .context("the reply did not match the expected shape")?;
 
-        eprintln!("  generate: ${cost:.4}");
+        eprintln!("  generate: ${cost:.4} ({})", self.model);
 
         if out.skip || out.questions.is_empty() {
             let reason = if out.reason.is_empty() { "nothing worth asking".into() } else { out.reason };

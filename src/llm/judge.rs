@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 pub struct CliJudge {
     pub cli: cli::Cli,
+    pub model: String,
     pub diff: String,
     /// The PR title and commit subjects. The reviewer can read these, so an
     /// answer that merely echoes them demonstrates nothing.
@@ -119,7 +120,7 @@ impl CliJudge {
             self.diff
         );
         let user = format!("# Question\n\n{question}\n\n# The reviewer's answer\n\n{answer}");
-        let (value, _) = self.cli.complete_json(cli::JUDGE_MODEL, &system, &user)?;
+        let (value, _) = self.cli.complete_json(&self.model, &system, &user)?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -132,7 +133,7 @@ impl CliJudge {
             "# Question\n\n{question}\n\n# Stored reference answer\n\n{reference}\n\n\
              # The reviewer's claim\n\n{claim}"
         );
-        let (value, _) = self.cli.complete_json(cli::JUDGE_MODEL, &system, &user)?;
+        let (value, _) = self.cli.complete_json(&self.model, &system, &user)?;
         Ok(serde_json::from_value(value)?)
     }
 }
@@ -171,6 +172,6 @@ impl Judge for CliJudge {
     }
 
     fn model(&self) -> &str {
-        cli::JUDGE_MODEL
+        &self.model
     }
 }

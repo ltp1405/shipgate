@@ -13,11 +13,20 @@ use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Generation gets the stronger model; judging gets a different one. §8: one
-/// model writing the question, the reference *and* the grade lets a wrong
-/// premise through unchallenged. Different models decorrelate that.
-pub const GENERATE_MODEL: &str = "opus";
-pub const JUDGE_MODEL: &str = "sonnet";
+/// Defaults, overridable in `~/.config/shipgate/config.toml`:
+///
+/// ```toml
+/// [models]
+/// generate = "sonnet"
+/// judge = "haiku"
+/// ```
+///
+/// The two must differ. One model writing the question, the reference *and* the
+/// grade lets a wrong premise through unchallenged (§8); two decorrelate it.
+/// Generation dominates the bill, so it is the first thing to lower — an
+/// earlier default of opus for generation cost roughly three times this.
+pub const GENERATE_MODEL: &str = "sonnet";
+pub const JUDGE_MODEL: &str = "haiku";
 
 #[derive(Deserialize)]
 struct CliResult {
