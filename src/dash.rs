@@ -166,7 +166,7 @@ mod tests {
     /// you stop reading.
     #[test]
     fn work_that_wants_you_sorts_above_finished_work() {
-        let mut rows = vec![
+        let mut rows = [
             row("a/x", 1, Status::Cleared),
             row("a/x", 2, Status::Ungated),
             row("a/x", 3, Status::Trivial),

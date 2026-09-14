@@ -141,8 +141,7 @@ impl App {
                 .iter()
                 .enumerate()
                 .take(here)
-                .filter(|(_, d)| pred(d))
-                .next_back()
+                .rfind(|(_, d)| pred(d))
                 .map(|(i, _)| i)
         };
         if let Some(i) = found {

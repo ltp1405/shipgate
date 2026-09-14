@@ -424,7 +424,6 @@ mod tests {
 
 #[cfg(test)]
 mod diff_render_tests {
-    use super::*;
     use super::tests::{draw, rows};
     use crate::tui::{App, Mode};
 

@@ -100,8 +100,6 @@ pub fn config_path() -> Option<std::path::PathBuf> {
 }
 
 pub fn load() -> Config {
-    let dirs = ();
-    let _ = dirs;
     let Some(path) = config_path() else {
         return Config::default();
     };
