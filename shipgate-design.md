@@ -170,6 +170,8 @@ Two effects, both intended. You can see when a pass means little. And a diff tha
 
 So there is **no line-count cap** on generation. A 2000-line diff gets the same three-to-six questions and a coverage line that reads `4/impossible`. The number is the feedback.
 
+**Generated files leave the quizzable set, not just the skip check.** Excluding them only when *every* changed file is generated is not enough: a lockfile riding along with real code still contributes hunks, and the generator will happily ask what the caller observes in `Cargo.lock`. That is precisely the noise §0 says drives people to the override. Filter generated hunks out before scoping, and report the count.
+
 Triage still skips entirely — before spending a token — when the diff is not code:
 
 - every changed file matches a lockfile / vendored / generated / minified pattern, or is `linguist-generated` in `.gitattributes`
@@ -205,17 +207,31 @@ v1 sent the diff alone. Two of its five question kinds are not answerable that w
 
 `context.rs` gathers, from static repo state only:
 
+0. **What the change says it is for** — the PR title, the commit subjects, and every changed path, including files outside the AI scope. Without these the generator can only see individual hunks, so it can only ask about individual hunks. Coherence is a property of the whole change, not of the part a model wrote.
+
 1. **Call sites.** For each symbol whose signature or semantics changed, `git grep -n` the identifier, with ±3 lines of context. A few hundred tokens; makes `cross_cutting` real.
 2. **Test invocation.** Parsed from `Makefile` / `package.json` / `Cargo.toml` / `justfile` / `bin/rails`, plus the test files touching the changed paths. Makes `checkable` real.
 3. **Before-content** of each changed file under ~200 lines.
 
 None of it is the coding session's transcript. The generator never sees the reasoning that produced the code, so it cannot inherit its mistakes.
 
+Commit subjects are the one debatable inclusion, being artifacts of that session. They are admitted because they are committed, reviewable text in the repository rather than raw session reasoning — but admitting them means the reviewer can read them too, which is exactly why §8 must refuse an answer that only echoes them.
+
 ## 7. `generate`
 
 Input is the **AI-authored hunks** plus context, not the whole diff.
 
-System prompt, in short: produce three to six questions that cannot be answered by paraphrasing the code. Prefer, in order: **checkable** (the reviewer obtains the answer by *running* something — use only the commands supplied), **prediction** ("if X were Y, what does the caller at this line observe"), **adversarial** ("what input breaks this"), **cross_cutting** ("what at the given call sites assumes this") — only where a call site was supplied — **justification** ("why this over the obvious alternative"). Never ask what a function does. Demand a specific value, branch or call site, never "what could go wrong". For each, give a reference answer and three hints of increasing strength. Return JSON only, or `{"skip": true, "reason": "…"}`.
+**Exactly four questions, and the first is always `intent`.**
+
+An earlier version asked for three to six, ranked `checkable` first and `justification` last, and fed the generator nothing but the AI-authored hunks. Every question it produced was local mechanism — trace this branch, name the failing test. A reviewer could answer all of them correctly and still not say what the change was *for*. That is the more damaging gap of the two: mechanism can be re-derived from the code later, but a change whose purpose nobody knows is the one that rots.
+
+**intent** must relate at least two files or hunks. Shapes that work: what single change of intent required all these files; which of these changes could be dropped and still deliver the goal; what would you expect this to have touched that it deliberately did not; what can a caller do now that they could not before. Never "what does this PR do" or "summarise this change" — those are paraphrase, which this section exists to prevent.
+
+The remaining three come from, in order: **checkable** (the reviewer obtains the answer by *running* something — only a command actually supplied), **prediction** ("if X were Y, what does the caller at this line observe"), **adversarial** ("what input breaks this"), **cross_cutting** ("what at the given call sites assumes this", only where a call site was supplied), **justification** ("why this over the obvious alternative").
+
+Never ask what a function does. Demand a specific value, branch or call site, never "what could go wrong". For each, give a reference answer and three hints of increasing strength. Return JSON only, or `{"skip": true, "reason": "…"}`.
+
+If the generator returns no intent question, the coverage line says so rather than passing quietly.
 
 **At least one `checkable` per gate, where a test command exists.** This is the structural defence against the shared blind spot in §8: a question you settle by running `bin/rails runner` or `cargo test` has a ground truth outside the model. Where `context.rs` found no runnable command, or the change has no observable behaviour (pure refactor), the generator may return none — and the gate prints `no checkable` in its coverage line. Requiring one unconditionally would only make the model invent a command, which is the exact failure being defended against.
 
@@ -232,11 +248,15 @@ System prompt, in short: produce three to six questions that cannot be answered 
 ]
 ```
 
-Strip ```` ```json ```` fences before parsing; on parse failure, retry once with the error appended.
+Calls go through the Claude Code CLI (`claude -p --output-format json --restricted`), not the Messages API. Rust has no official Anthropic SDK, so a raw-HTTP client could only ever be checked against documentation rather than a live response — it was written, could not be exercised, and was removed. `--restricted` strips the tools that run commands or code: this needs text in and text out, and the subprocess has no business touching the repository it is being asked about.
+
+The CLI has no schema enforcement, so the expected shape is stated in the prompt and the reply is parsed with a **string-aware brace scanner** — a `{` inside a quoted value is common in answers that quote code, and naive brace counting mis-terminates on it. On a parse failure the model is asked once more with the error appended.
+
+Anchors are still verified locally. A model can return an anchor string that matches no hunk, and an unverified one would silently corrupt coverage accounting and the §9 re-quiz path, so an unknown anchor is remapped onto a real hunk rather than trusted.
 
 ## 8. `judge`
 
-**Grade with a different model than the one that generated.** The generator writes the question, the reference *and* — under a single-model design — the grade. A wrong premise then sails through all three unchallenged, and dispute mode is the only escape, which requires you to spot it yourself. Different models do not eliminate correlated error (same family, overlapping training) but they decorrelate it materially, and the cost is zero: generate with the stronger model, judge with the cheaper one. Record `judge_model` on every attempt so a calibration shift is visible later rather than inferred.
+**Grade with a different model than the one that generated** — opus generates, sonnet judges. The generator writes the question, the reference *and* — under a single-model design — the grade. A wrong premise then sails through all three unchallenged, and dispute mode is the only escape, which requires you to spot it yourself. Different models do not eliminate correlated error (same family, overlapping training) but they decorrelate it materially, and the cost is zero: generate with the stronger model, judge with the cheaper one. Record `judge_model` on every attempt so a calibration shift is visible later rather than inferred.
 
 This is a mitigation, not a fix. The real defence is `checkable` questions, whose answers come from running code.
 
@@ -250,9 +270,11 @@ This is a mitigation, not a fix. The real defence is `checkable` questions, whos
 
 `wrong` → 0.0, `restates` → 0.3, `partial` → 0.6, `demonstrates` → 0.9.
 
+**Refuse a restatement.** The judge is shown the PR title and commit subjects under the heading *the reviewer can already read all of this*, and scores `wrong` when an answer merely echoes them. Without this the intent question collapses back into paraphrase, since the reviewer is handed the same text the generator was.
+
 **Deterministic precheck, before any API call.** If the answer contains no literal token from the diff — identifier, line number, file name — label it `wrong` locally at zero cost. v1's rubric published its own answer key ("reward consequences, invariants, failure modes, facts not literally present"), and one sentence naming a rollback gap, an unvalidated input and a concurrency invariant scores well on a large fraction of diffs without reading any code. The judge prompt also carries the explicit negative: *score `wrong` if the answer would be equally true of an arbitrary code change.*
 
-**Borderline re-judge.** At `partial`, re-judge twice at temperature 0 and take the median label.
+**Borderline re-judge.** At `partial` — the label that decides a pass under drop-lowest — re-judge twice and take the median label. An earlier draft said "at temperature 0"; there is no temperature control through the CLI, so the re-runs are plain repeats and the median is taken over the model's natural variance. A failed re-judge keeps the first label rather than failing the answer.
 
 **Pass rule: drop-lowest, not min.** All but one question at `partial` or better, and the dropped one no worse than `restates`.
 
@@ -268,7 +290,7 @@ Guards, because v1 made dispute-everything free:
 
 - at most one dispute per question, two per gate
 - the body must cite a file and line present in the diff, checked locally before the call
-- temperature 0, high bar: upheld only if the judge can state the concrete failing input or the contradicted line
+- a high bar, stated in the prompt rather than through sampling parameters: upheld only if the judge can state the concrete failing input or quote the contradicted line
 - **`code_bug` does not auto-pass.** The question goes to `deferred`, the gate can still clear, and an `obligations` row opens — settled by fixing the bug or withdrawing the claim before the next gate on that repo clears
 - `premise` / `reference` upheld drops the question and regenerates one replacement for the same anchor
 - not upheld is recorded as a scored attempt with the judge's feedback
@@ -292,7 +314,7 @@ On clear, assemble a description from **your** answers — not the reference ans
 
 ```markdown
 ## What this changes
-<from the justification answer, or gh's commit list if none>
+<from the intent answer — falling back to justification, then gh's commit list>
 
 ## Behaviour worth knowing
 <the prediction and adversarial answers, lightly edited>
@@ -356,11 +378,39 @@ After submit: label, feedback, and the reference revealed on `demonstrates` or a
 
 ## 13. Cost
 
-A 300-line AI-authored slice is roughly 4k tokens; context adds ~1k. Scoping to AI hunks cuts generator input on mixed PRs, often by half.
+**Measured, not estimated — but read the unit carefully.** Model calls go through the Claude Code CLI (`claude -p`), which uses its own credentials.
 
-Roughly 25k in / 4k out per PR — about $0.10, or ~$0.03 with prompt caching on the diff block, written once in `generate` and read by every judge call. At one to three PRs a day, a rounding error.
+The figures below come from the CLI's `total_cost_usd`, which reports `costBasis: "list"`: the **published API list price of the tokens consumed**. What that means for you depends on how Claude Code is authenticated:
 
-v1's Stop hook fired at every Claude Code turn end: 10–25 gates and 30–100 questions a day. The cost was survivable; the question volume was not.
+- **API key** (`ANTHROPIC_API_KEY`) — this is money billed, directly.
+- **OAuth / subscription** (an `oauthAccount` in `~/.claude.json`, no key set) — nothing is billed per call. The usage draws against plan limits, and the dollar figure is a *proxy for token consumption*, not an invoice.
+
+Either way the number is the right relative signal — it is proportional to tokens, so the comparisons below hold — but do not quote it as a bill without checking which case applies.
+
+Measured against this project's own PR, ~22 AI-authored hunks, four questions:
+
+| | cost |
+|---|---|
+| `generate` on opus, cold / warm | $1.13 / $0.80 |
+| `generate` on sonnet | **$0.52** |
+| `judge` on haiku, per answered question | ~$0.05 |
+| answers killed by the §8 precheck | $0.00 |
+
+The defaults are **sonnet to generate, haiku to judge** — roughly half what opus-and-sonnet cost, with question quality holding up in side-by-side runs. Set them in `~/.config/shipgate/config.toml`:
+
+```toml
+[models]
+generate = "sonnet"
+judge = "haiku"
+```
+
+Whatever they are set to, the two must differ: §8 rests on the grader not being the model that wrote the question and the reference.
+
+An earlier draft of this section estimated $0.03–0.10 per PR from token counts alone. That was wrong by more than an order of magnitude, for two reasons it did not account for:
+
+Remaining levers, in order of value: ask for fewer questions; keep the precheck, which is free and killed five of six answers in the run above; and remember the bill scales with **PR count**, not repo size — a busy backlog is where this bites, not a large codebase.
+
+Against the time a PR takes to review, this is small either way — but it is not free, and it scales with PR count, not repo size. The comparison that matters is proportional, so it survives the billing question: v1's Stop hook fired at every Claude Code turn end, so 10–25 gates a day would consume **10–25× what the PR-ready gate does**. On an API key that is $15–35/day; on a subscription it is the difference between a gate you barely notice and one that exhausts your limits by lunchtime. Either way it settles the placement question independently of the ergonomics argument.
 
 ## 14. Build order
 
