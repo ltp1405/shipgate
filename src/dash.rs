@@ -55,22 +55,40 @@ pub struct Row {
 /// remembers, so anything already quizzed stays reachable without config.
 fn roots(conn: &Connection, cfg: &config::Config) -> Result<Vec<PathBuf>> {
     let mut seen = BTreeSet::new();
-    for w in &cfg.watch {
-        let p = w.expanded();
+    // Canonical, so a symlinked path and its target are one root rather than
+    // two views of the same repository.
+    let mut add = |p: PathBuf, seen: &mut BTreeSet<PathBuf>| {
         if p.is_dir() {
-            seen.insert(p);
+            seen.insert(p.canonicalize().unwrap_or(p));
         }
+    };
+    for w in &cfg.watch {
+        add(w.expanded(), &mut seen);
     }
     for g in db::all_gates(conn)? {
         if g.path.is_empty() {
             continue;
         }
-        let p = PathBuf::from(&g.path);
-        if p.is_dir() {
-            seen.insert(p);
-        }
+        add(PathBuf::from(&g.path), &mut seen);
     }
     Ok(seen.into_iter().collect())
+}
+
+/// One root per repository. A worktree is a different directory and the same
+/// GitHub repository, and a gate created in one adds its path to the roots —
+/// so a repo with a worktree checked out listed every one of its PRs twice,
+/// once per directory. Paths cannot see this; only the slug can.
+///
+/// The first root wins, which is the shortest path under `roots`' ordering —
+/// the main checkout rather than a worktree of it. It only decides where `gh`
+/// is run: a row still carries its own gate's path, so quizzing happens in the
+/// directory the gate was created in.
+fn one_root_per_repo(resolved: Vec<(PathBuf, String)>) -> Vec<(PathBuf, String)> {
+    let mut seen = BTreeSet::new();
+    resolved
+        .into_iter()
+        .filter(|(_, repo)| seen.insert(repo.clone()))
+        .collect()
 }
 
 /// One network round trip per repository, so this is the slow part of opening
@@ -81,15 +99,17 @@ pub fn collect(conn: &Connection) -> Result<(Vec<Row>, Vec<String>)> {
     let mut rows = Vec::new();
     let mut problems = Vec::new();
 
+    // Slugs first, then one root per repository: two directories of the same
+    // repo would otherwise each list all of its PRs.
+    let mut resolved = Vec::new();
     for root in roots(conn, &cfg)? {
-        let repo = match gh::repo_slug(&root) {
-            Ok(r) => r,
-            Err(e) => {
-                problems.push(format!("{}: {e}", root.display()));
-                continue;
-            }
-        };
+        match gh::repo_slug(&root) {
+            Ok(repo) => resolved.push((root, repo)),
+            Err(e) => problems.push(format!("{}: {e}", root.display())),
+        }
+    }
 
+    for (root, repo) in one_root_per_repo(resolved) {
         let prs = match gh::my_open_prs(&root) {
             Ok(p) => p,
             Err(e) => {
@@ -148,6 +168,21 @@ fn coverage_of(conn: &Connection, g: &db::Gate) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worktree is a second directory for the same repository, and a gate
+    /// created in one puts its path into the roots. Listing both meant every
+    /// PR of that repo appearing twice on the dashboard.
+    #[test]
+    fn a_repo_with_a_worktree_is_listed_once() {
+        let out = one_root_per_repo(vec![
+            (PathBuf::from("/w/project"), "Org/project".into()),
+            (PathBuf::from("/w/project__worktrees/feature"), "Org/project".into()),
+            (PathBuf::from("/w/other"), "Org/other".into()),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, PathBuf::from("/w/project"), "the main checkout should win");
+        assert_eq!(out[1].1, "Org/other");
+    }
 
     fn row(repo: &str, pr: u64, status: Status) -> Row {
         Row {
