@@ -221,13 +221,23 @@ Commit subjects are the one debatable inclusion, being artifacts of that session
 
 Input is the **AI-authored hunks** plus context, not the whole diff.
 
-**Exactly four questions, and the first is always `intent`.**
+**A band of three to six questions, and the first is always `intent`.**
 
-An earlier version asked for three to six, ranked `checkable` first and `justification` last, and fed the generator nothing but the AI-authored hunks. Every question it produced was local mechanism — trace this branch, name the failing test. A reviewer could answer all of them correctly and still not say what the change was *for*. That is the more damaging gap of the two: mechanism can be re-derived from the code later, but a change whose purpose nobody knows is the one that rots.
+An earlier version asked for an open three to six, ranked `checkable` first and `justification` last, and fed the generator nothing but the AI-authored hunks. Every question it produced was local mechanism — trace this branch, name the failing test. A reviewer could answer all of them correctly and still not say what the change was *for*. That is the more damaging gap of the two: mechanism can be re-derived from the code later, but a change whose purpose nobody knows is the one that rots. The fix was context and a fixed count of four; the count was the part that did not need fixing.
+
+**The band, not the count.** `triage::question_band` computes a floor and ceiling from the diff before a token is spent, and the generator picks inside it. Deterministic and free — no second model call to choose a number, which would re-read the diff to learn less than the generator already knows while holding it.
+
+Scaled by *areas*, not lines: distinct files carrying a semantic change, plus each further hunk in them at half weight. A 2000-line mechanical rename is one idea; a 40-line lock-ordering change across four files is four. `max = clamp(2 + areas / 2, 3, 6)`.
+
+- **The floor is 3** because the pass rule drops the lowest score, and dropping one of two is a coin toss.
+- **The ceiling is 6** because the quiz competes with reviewing the PR. Past that it becomes the thing you route around, which §0 says is how this fails.
+- **The prompt states the range as a range**, with "a padded question is worse than a missing one". A generator told to write four writes four, and the last two are invented. Under the floor is accepted and noted; over the ceiling is trimmed, and the `intent` question survives the trim wherever it appeared.
+
+Open: the §8 pass rule is count-sensitive. Drop-lowest tolerates one bad judge call at three questions and demands five good ones at six, so a wider band quietly tightens the gate. Measure the pass rate at five and six before treating the ceiling as settled; the fix, if it needs one, is dropping the lowest `n / 3` rather than the lowest one.
 
 **intent** must relate at least two files or hunks. Shapes that work: what single change of intent required all these files; which of these changes could be dropped and still deliver the goal; what would you expect this to have touched that it deliberately did not; what can a caller do now that they could not before. Never "what does this PR do" or "summarise this change" — those are paraphrase, which this section exists to prevent.
 
-The remaining three come from, in order: **checkable** (the reviewer obtains the answer by *running* something — only a command actually supplied), **prediction** ("if X were Y, what does the caller at this line observe"), **adversarial** ("what input breaks this"), **cross_cutting** ("what at the given call sites assumes this", only where a call site was supplied), **justification** ("why this over the obvious alternative").
+The remaining questions come from, in order: **checkable** (the reviewer obtains the answer by *running* something — only a command actually supplied), **prediction** ("if X were Y, what does the caller at this line observe"), **adversarial** ("what input breaks this"), **cross_cutting** ("what at the given call sites assumes this", only where a call site was supplied), **justification** ("why this over the obvious alternative").
 
 Never ask what a function does. Demand a specific value, branch or call site, never "what could go wrong". For each, give a reference answer and three hints of increasing strength. Return JSON only, or `{"skip": true, "reason": "…"}`.
 

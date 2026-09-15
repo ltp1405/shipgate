@@ -9,13 +9,16 @@ pub struct CliGenerator {
     pub model: String,
 }
 
-const SYSTEM: &str = "\
+const SYSTEM_TEMPLATE: &str = "\
 You write review questions for a pull request. You see the changed hunks, the \
 change's stated purpose, and static repository context — never the session that \
 produced the code, so do not assume any reasoning behind it.
 
-Produce exactly four questions that cannot be answered by paraphrasing anything \
-you were given.
+Produce between {min} and {max} questions that cannot be answered by paraphrasing \
+anything you were given. The range is how much distinct change is in front of \
+you, not a target: ask {max} only if there are {max} separate things worth \
+understanding, and {min} if there are {min}. A padded question is worse than a \
+missing one — it teaches the reviewer the quiz is noise.
 
 The FIRST question must be `intent`, and there must be exactly one. It tests \
 whether the reviewer understands what this change is *for* — something they \
@@ -28,7 +31,7 @@ two files or hunks. Good shapes:
   - what can a caller do now that they could not before
 Never ask 'what does this PR do' or 'summarise this change'.
 
-The remaining three come from, in this order:
+The remaining questions come from, in this order:
   checkable — the reviewer obtains the answer by RUNNING something. Use only a \
     command given to you in the context. If none was given, do not use this kind.
   prediction — 'if X were Y, what does the caller at this line observe'.
@@ -85,6 +88,42 @@ const SHAPE: &str = r#"{
   ]
 }"#;
 
+/// The band is stated in the prompt rather than enforced only on the way back:
+/// a generator told to write four questions writes four, and the last two are
+/// padding it had to invent.
+fn system_prompt(min: usize, max: usize) -> String {
+    format!(
+        "{}\n\n# Reply with exactly this shape\n\n{SHAPE}",
+        SYSTEM_TEMPLATE
+            .replace("{min}", &min.to_string())
+            .replace("{max}", &max.to_string())
+    )
+}
+
+/// Hold the reply to the band. Over the ceiling is trimmed; under the floor is
+/// kept, since only the generator can tell a missing question from a padded one
+/// and it was told to prefer the former.
+fn fit(mut questions: Vec<Question>, min: usize, max: usize) -> Vec<Question> {
+    if questions.len() > max {
+        // The intent question is the one no other hunk can supply, so it
+        // survives truncation wherever the generator happened to put it.
+        if let Some(i) = questions.iter().position(|q| q.kind == "intent") {
+            questions.swap(0, i);
+        }
+        eprintln!(
+            "  generator returned {} questions for a ceiling of {max} — keeping {max}",
+            questions.len()
+        );
+        questions.truncate(max);
+    } else if questions.len() < min {
+        eprintln!(
+            "  note: {} questions for a floor of {min} — the generator found less to ask about",
+            questions.len()
+        );
+    }
+    questions
+}
+
 pub fn render_hunks(ctx: &Context) -> String {
     let mut s = String::new();
     for h in ctx.hunks {
@@ -129,7 +168,8 @@ impl Generator for CliGenerator {
             user.push_str(&format!("# Call sites\n\n{}\n", ctx.call_sites.join("\n")));
         }
 
-        let system = format!("{SYSTEM}\n\n# Reply with exactly this shape\n\n{SHAPE}");
+        let (min, max) = ctx.questions;
+        let system = system_prompt(min, max);
         let (value, cost) = self
             .cli
             .complete_json(&self.model, &system, &user)?;
@@ -147,8 +187,8 @@ impl Generator for CliGenerator {
         // A hallucinated anchor would silently break coverage accounting and
         // the re-quiz path, so map unknown anchors back onto a real hunk.
         let fallback = &ctx.hunks[0];
-        let questions = out
-            .questions
+        let returned = fit(out.questions, min, max);
+        let questions = returned
             .into_iter()
             .map(|q| {
                 let known = ctx.hunks.iter().any(|h| h.anchor == q.anchor);
@@ -169,5 +209,50 @@ impl Generator for CliGenerator {
             .collect();
 
         Ok(Some(questions))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn q(kind: &str) -> Question {
+        Question {
+            kind: kind.into(),
+            file: "f.rs".into(),
+            anchor: "a".into(),
+            text: "t".into(),
+            reference: "r".into(),
+            hints: vec![],
+        }
+    }
+
+    #[test]
+    fn the_prompt_states_the_band_it_was_given() {
+        let p = system_prompt(3, 6);
+        assert!(p.contains("between 3 and 6 questions"), "{p}");
+        assert!(!p.contains("{min}") && !p.contains("{max}"), "placeholder left in the prompt");
+    }
+
+    #[test]
+    fn a_reply_over_the_ceiling_is_trimmed() {
+        let out = fit(vec![q("intent"), q("prediction"), q("adversarial"), q("justification")], 3, 3);
+        assert_eq!(out.len(), 3);
+    }
+
+    /// Every other kind can be asked of another hunk; the intent question
+    /// cannot, and a gate without one is what `NO INTENT QUESTION` warns about.
+    #[test]
+    fn trimming_never_drops_the_intent_question() {
+        let out = fit(vec![q("prediction"), q("adversarial"), q("intent")], 3, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, "intent");
+    }
+
+    /// Under the floor is the generator saying there was less here than the
+    /// band assumed. Padding it back up is exactly what the band exists to stop.
+    #[test]
+    fn a_reply_under_the_floor_is_left_alone() {
+        assert_eq!(fit(vec![q("intent"), q("prediction")], 4, 6).len(), 2);
     }
 }

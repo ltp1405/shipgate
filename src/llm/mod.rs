@@ -33,6 +33,10 @@ pub struct Context<'a> {
     /// Every changed path, including files outside the AI scope: coherence is a
     /// property of the whole change, not of the part a model wrote.
     pub all_files: Vec<String>,
+    /// How many questions this diff is worth (§4, `triage::question_band`).
+    /// The generator picks inside it: only it knows whether one more question
+    /// would be one more idea or padding.
+    pub questions: (usize, usize),
 }
 
 impl Context<'_> {

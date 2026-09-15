@@ -81,6 +81,9 @@ impl Generator for StubGenerator {
                 ],
             });
         }
+        // The stand-ins answer to the band as well, or --offline would show a
+        // quiz shape the real generator cannot produce.
+        out.truncate(ctx.questions.1.max(1));
         Ok(Some(out))
     }
 }

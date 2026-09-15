@@ -206,6 +206,11 @@ impl Ready {
             triage::Verdict::Quiz => {}
         }
 
+        // §4 — how many questions this diff is worth, before the generator is
+        // asked for any. Deterministic, free, and printed, so a thin band on a
+        // large PR is visible rather than inferred from the coverage line.
+        let band = triage::question_band(&ai_hunks);
+
         let ctx = llm::Context {
             diff: &diff,
             hunks: &ai_hunks,
@@ -214,6 +219,7 @@ impl Ready {
             pr_title: pr.title.clone(),
             commit_subjects: gh::pr_commits(&dir, pr.number).unwrap_or_default(),
             all_files: git::changed_files(&dir, &base_sha, &head_sha)?,
+            questions: band,
         };
         if ctx.test_command.is_none() {
             eprintln!("note: no test command found — no checkable question is possible");
@@ -221,7 +227,12 @@ impl Ready {
 
         let generator: Box<dyn llm::Generator> = match self.backend() {
             Some(cli) => {
-                println!("Generating questions…");
+                let (min, max) = band;
+                if min == max {
+                    println!("Generating {min} questions…");
+                } else {
+                    println!("Generating {min}–{max} questions…");
+                }
                 Box::new(llm::generate::CliGenerator {
                     cli,
                     model: cfg.models.generate.clone(),
