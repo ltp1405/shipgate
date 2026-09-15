@@ -372,6 +372,8 @@ One screen, two panes. `?` for keys.
 
 Keys: `e` opens `$EDITOR` on the answer buffer, `h` next hint, `d` dispute, `Enter` submit, `j`/`k` scroll the diff.
 
+**Any question, any order.** `tab`/`shift-tab` walk the questions and `1`-`9` jump straight to one; `space` still takes the next one that needs you. The generator's order is not a reading order — the checkable question is often only answerable once the intent question has been thought through, and the reverse as often. Each question keeps its own draft, so wandering off to read another costs nothing. Passed and in-flight questions are reachable too: re-reading what you said is not an error to be prevented.
+
 After submit: label, feedback, and the reference revealed on `demonstrates` or after a second failed attempt. **A short answer must be able to score `demonstrates`** — one sentence naming the consequence plus a line reference is complete, and the rubric says so.
 
 **No blocking calls on the UI thread.** Each request runs on a `std::thread::spawn` writing into an `mpsc::Sender<AppEvent>`; the event loop selects over `crossterm::event::poll(16ms)` and `rx.try_recv()`. `reqwest::blocking` stays inside `llm/`. Without this the terminal freezes 5–30s per judge call with no redraw and no Ctrl-C.

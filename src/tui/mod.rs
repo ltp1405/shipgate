@@ -349,9 +349,10 @@ fn build_diff_view(diff: &str, ai_hunks: &[git::Hunk]) -> Vec<DiffLine> {
 }
 
 const STATUS_ANSWERING: &str =
-    "a answer · h hint · n/p hunk · [/] file · g back · ←/→ pan · q quit";
-const STATUS_ANSWERED: &str = "^s submit & move on · e revise · h hint · n/p hunk · g back · q quit";
-const STATUS_REVIEWING: &str = "space next · e revise · n/p hunk · g back · q quit";
+    "a answer · h hint · tab/1-9 question · n/p hunk · [/] file · g back · q quit";
+const STATUS_ANSWERED: &str =
+    "^s submit & move on · e revise · h hint · tab/1-9 question · g back · q quit";
+const STATUS_REVIEWING: &str = "space next · tab/1-9 question · e revise · g back · q quit";
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -625,6 +626,28 @@ fn event_loop(
             // Back to the hunk this question is about, after wandering off.
             (KeyCode::Char('g'), _) => app.jump_to_anchor(ai_hunks),
 
+            // Free movement between questions. Which one you can answer is not
+            // the tool's call: the checkable question is often obvious once you
+            // have read the intent one, and the reverse is just as often true.
+            // Passed and in-flight questions are reachable too — you may want
+            // to re-read what you said.
+            (KeyCode::Tab, _) => goto(app, app.current + 1, ai_hunks),
+            (KeyCode::BackTab, _) => {
+                let n = app.questions.len();
+                goto(app, app.current + n.saturating_sub(1), ai_hunks);
+            }
+
+            // Straight to a question by number, for a quiz short enough to see
+            // the whole footer at once.
+            (KeyCode::Char(c), _) if c.is_ascii_digit() && c != '0' => {
+                let want = c.to_digit(10).unwrap() as usize - 1;
+                if want < app.questions.len() {
+                    goto(app, want, ai_hunks);
+                } else {
+                    app.status = format!("no question {c}");
+                }
+            }
+
             // Next question that still needs you. Passed ones are skipped,
             // since re-grading them costs a judge call and changes nothing, and
             // so are the ones sitting with the judge.
@@ -689,6 +712,22 @@ fn event_loop(
             _ => {}
         }
     }
+}
+
+/// Move to question `i`, wrapping. Unlike `advance` this goes wherever it is
+/// told: passed, failed, or with the judge.
+fn goto(app: &mut App, i: usize, ai_hunks: &[git::Hunk]) {
+    if app.questions.is_empty() {
+        return;
+    }
+    app.current = i % app.questions.len();
+    app.status = match app.mode() {
+        Mode::Grading => format!("question {} is with the judge", app.current + 1),
+        Mode::Reviewing => STATUS_REVIEWING.into(),
+        Mode::Answering if app.answer().is_empty() => STATUS_ANSWERING.into(),
+        Mode::Answering => STATUS_ANSWERED.into(),
+    };
+    app.jump_to_anchor(ai_hunks);
 }
 
 /// Move to the next question that still needs answering. `false` when there is
@@ -1172,6 +1211,71 @@ diff --git a/sync.rs b/sync.rs
             .unwrap();
         assert_eq!(attempts, 1, "the answer was graded twice");
         assert_eq!(app.scores[0], Label::Partial.score());
+    }
+
+    fn tab() -> event::KeyEvent {
+        event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+    }
+    fn back_tab() -> event::KeyEvent {
+        event::KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+    }
+
+    /// Reading order is not answering order: the checkable question is often
+    /// only obvious once the intent one has been read, and the reverse too.
+    #[test]
+    fn a_digit_jumps_straight_to_that_question() {
+        let app = drive(
+            3,
+            llm::stub::StubJudge::default(),
+            vec![key('3'), key('a')],
+        );
+        assert_eq!(app.current, 2);
+        assert!(!app.slots[2].answer.is_empty(), "answered the wrong question");
+        assert!(app.slots[0].answer.is_empty());
+        assert!(app.slots[1].answer.is_empty());
+    }
+
+    #[test]
+    fn a_digit_past_the_last_question_says_so_and_stays_put() {
+        let app = drive(2, llm::stub::StubJudge::default(), vec![key('9')]);
+        assert_eq!(app.current, 0);
+        assert!(app.status.contains("no question 9"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn tab_walks_the_questions_and_wraps() {
+        let app = drive(3, llm::stub::StubJudge::default(), vec![tab(), tab(), tab()]);
+        assert_eq!(app.current, 0, "tab did not wrap back round");
+        let app = drive(3, llm::stub::StubJudge::default(), vec![back_tab()]);
+        assert_eq!(app.current, 2, "shift-tab did not wrap backwards");
+    }
+
+    /// Each question keeps its own draft. Wandering off to read another one
+    /// and coming back must not cost you what you had written.
+    #[test]
+    fn every_question_keeps_its_own_draft() {
+        let app = drive(
+            2,
+            llm::stub::StubJudge::default(),
+            vec![key('a'), tab(), key('a'), tab()],
+        );
+        assert_eq!(app.current, 0);
+        assert!(!app.slots[0].answer.is_empty(), "lost the first draft");
+        assert!(!app.slots[1].answer.is_empty(), "lost the second draft");
+    }
+
+    /// Jumping onto a question that is with the judge is allowed — you may
+    /// want to re-read what you sent — but it says so rather than looking idle.
+    #[test]
+    fn landing_on_a_question_with_the_judge_says_what_it_is_doing() {
+        let (conn, hunks, questions) = fixture(2);
+        let mut app = App::new(questions, build_diff_view(DIFF, &hunks));
+        app.current = 1;
+        app.slots[0].pending = Some(Pending { answer: "a".into(), hints_used: 0 });
+        goto(&mut app, 0, &hunks);
+        assert_eq!(app.current, 0);
+        assert!(app.status.contains("with the judge"), "status: {}", app.status);
+        drop(conn);
     }
 
     #[test]
