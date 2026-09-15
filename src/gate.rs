@@ -55,6 +55,14 @@ impl std::fmt::Display for Coverage {
 /// at three questions and 11.4% at six. `n / 3` holds the bar at two thirds
 /// wherever the band lands — 1.6% at six — and leaves the three-question case
 /// exactly as it was.
+/// A gate every question left on an upheld dispute. `passes` takes an empty
+/// slice as a pass — no questions, nothing failed — which is right for a
+/// trivial diff and wrong here: disputing your way to zero questions would
+/// clear the gate without answering anything.
+fn nothing_was_answered(scores: &[f64], questions: usize) -> bool {
+    scores.is_empty() && questions > 0
+}
+
 pub fn passes(scores: &[f64]) -> bool {
     if scores.is_empty() {
         return true;
@@ -301,6 +309,10 @@ impl Ready {
             ctx.restatement_sources(),
         )?;
 
+        if nothing_was_answered(&scores, questions.len()) {
+            println!("\nEvery question left the quiz on an upheld dispute — nothing was answered.");
+            return Ok(());
+        }
         if !passes(&scores) {
             println!("\nNot cleared. Re-run when you want another go — disagreements are cheap.");
             return Ok(());
@@ -390,6 +402,10 @@ impl Ready {
         let mut sources = vec![pr.title.clone()];
         sources.extend(gh::pr_commits(dir, pr.number).unwrap_or_default());
         let scores = self.quiz(conn, &gate.diff, &ai_hunks, questions.clone(), sources)?;
+        if nothing_was_answered(&scores, questions.len()) {
+            println!("\nEvery question left the quiz on an upheld dispute — nothing was answered.");
+            return Ok(());
+        }
         if !passes(&scores) {
             println!("\nNot cleared.");
             return Ok(());
@@ -413,6 +429,13 @@ impl Ready {
         if done > 0 {
             println!("{done} of {} already passed — resuming.", questions.len());
         }
+        let settled = questions
+            .iter()
+            .filter(|q| q.status == "waived" || q.status == "deferred")
+            .count();
+        if settled > 0 {
+            println!("{settled} out of the quiz on an upheld dispute.");
+        }
 
         let judge: Arc<dyn llm::Judge + Send + Sync> = match self.backend() {
             Some(cli) => Arc::new(llm::judge::CliJudge {
@@ -434,14 +457,19 @@ impl Ready {
                 questions,
             )
         } else {
-            let mut scores = tui::App::restored_scores(&questions);
+            // Piped stdin: no TUI, so no disputing either. A question an
+            // earlier run took out of the quiz stays out — asking it again
+            // here would re-score what a judge already agreed was unfair.
+            let restored = tui::App::restored_scores(&questions);
+            let mut scores = Vec::new();
             for (i, q) in questions.iter().enumerate() {
-                if q.status == "passed" {
-                    continue;
+                match q.status.as_str() {
+                    "passed" => scores.push(restored[i]),
+                    "waived" | "deferred" => continue,
+                    _ => scores.push(self.ask(
+                        conn, judge.as_ref(), diff, ai_hunks, q, i + 1, questions.len(),
+                    )?),
                 }
-                scores[i] = self.ask(
-                    conn, judge.as_ref(), diff, ai_hunks, q, i + 1, questions.len(),
-                )?;
             }
             Ok(scores)
         }
@@ -558,6 +586,19 @@ impl Ready {
 
         if let Some(a) = answer_for("checkable") {
             body.push_str(&format!("\n## Verified\n\n{a}\n"));
+        }
+
+        // §8 — an upheld code_bug is an open obligation, and the PR is the
+        // place it is owed. Quietly clearing the gate without saying so is how
+        // "the code is wrong" becomes a free skip.
+        let deferred: Vec<&db::Question> =
+            questions.iter().filter(|q| q.status == "deferred").collect();
+        if !deferred.is_empty() {
+            body.push_str("\n## Open on this change\n\n");
+            for q in deferred {
+                let claim = db::last_dispute(conn, q.id)?.unwrap_or_default();
+                body.push_str(&format!("- {} — {claim}\n", q.file));
+            }
         }
 
         // The coverage line ships in the description too: anyone trusting this
@@ -722,6 +763,16 @@ mod tests {
     #[test]
     fn the_dropped_one_still_has_a_floor() {
         assert!(!passes(&[0.9, 0.9, 0.0]));
+    }
+
+    /// An empty score list is a pass — no questions, nothing failed — which is
+    /// right for a trivial diff. A gate whose questions all left on a dispute
+    /// reaches the same state by a different road, and must not clear.
+    #[test]
+    fn disputing_every_question_away_is_not_a_pass() {
+        assert!(super::nothing_was_answered(&[], 3));
+        assert!(!super::nothing_was_answered(&[], 0), "a trivial gate still clears");
+        assert!(!super::nothing_was_answered(&[0.9], 3));
     }
 
     /// §7 scaled the question count; a fixed drop would have scaled the bar

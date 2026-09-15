@@ -87,8 +87,22 @@ pub struct Verdict {
     pub feedback: String,
 }
 
+/// §8 dispute: the reviewer's claim that the question, its reference answer or
+/// the code itself is wrong, and what the judge made of it.
+pub struct Disputed {
+    pub upheld: bool,
+    /// `premise` | `reference` | `code_bug`. Meaningless unless upheld.
+    pub kind: String,
+    pub feedback: String,
+}
+
 pub trait Judge {
     fn judge(&self, diff: &str, question: &str, answer: &str) -> Result<Verdict>;
+    /// The reference answer goes to the judge and never to the reviewer: a
+    /// dispute is judged against the code, but the reference is what the claim
+    /// is often about, and revealing it would turn disputing into a way to read
+    /// the answer.
+    fn dispute(&self, question: &str, reference: &str, claim: &str) -> Result<Disputed>;
     fn model(&self) -> &str;
 }
 
@@ -116,6 +130,43 @@ pub fn cites_the_diff(answer: &str, hunks: &[crate::git::Hunk]) -> bool {
         return true;
     }
     tokens.iter().any(|t| lower.contains(t.as_str()))
+}
+
+/// §8 dispute guard, run before any call. A dispute has to name a line that is
+/// actually in the diff — not a file, a line. The precheck on answers accepts a
+/// bare identifier, which is right for an answer and far too loose here: the
+/// whole point of the guard is that disputing costs thought, or it becomes the
+/// free way past a question you did not like.
+pub fn cites_a_changed_line(claim: &str, hunks: &[crate::git::Hunk]) -> bool {
+    hunks.iter().any(|h| {
+        let Some(start) = hunk_start(&h.header) else { return false };
+        // New-side lines: everything in the body but the header and removals.
+        let span = h
+            .body
+            .lines()
+            .skip(1)
+            .filter(|l| !l.starts_with('-'))
+            .count() as u32;
+        let names: Vec<&str> = std::iter::once(h.file.as_str())
+            .chain(h.file.rsplit('/').next())
+            .collect();
+
+        (start..start + span.max(1)).any(|n| {
+            let cite = format!(":{n}");
+            names.iter().any(|name| {
+                claim
+                    .match_indices(name)
+                    .any(|(i, _)| claim[i + name.len()..].starts_with(&cite))
+            })
+        })
+    })
+}
+
+/// Parse the new-side start out of `@@ -12,3 +88,9 @@`.
+fn hunk_start(header: &str) -> Option<u32> {
+    let plus = header.split('+').nth(1)?;
+    let digits: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 #[cfg(test)]
@@ -151,5 +202,49 @@ mod tests {
     #[test]
     fn short_words_do_not_count_as_citations() {
         assert!(!cites_the_diff("let it be", &hunks()));
+    }
+}
+
+#[cfg(test)]
+mod dispute_guard_tests {
+    use super::*;
+    use crate::git;
+
+    const DIFF: &str = "\
+diff --git a/src/sync.rs b/src/sync.rs
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -80,2 +88,3 @@
+ let before = 1;
+-let gone = 2;
++let retry_count = 3;
+";
+
+    fn hunks() -> Vec<git::Hunk> {
+        git::parse_diff(DIFF)
+    }
+
+    #[test]
+    fn a_line_inside_the_hunk_counts() {
+        assert!(cites_a_changed_line("sync.rs:89 never decrements it", &hunks()));
+        assert!(cites_a_changed_line("see src/sync.rs:88", &hunks()));
+    }
+
+    #[test]
+    fn a_line_outside_the_hunk_does_not() {
+        assert!(!cites_a_changed_line("sync.rs:400 is the problem", &hunks()));
+    }
+
+    /// The answer precheck accepts a bare identifier. Disputing is cheap and
+    /// upholding is not, so this one wants the line.
+    #[test]
+    fn naming_the_file_without_a_line_is_not_enough() {
+        assert!(!cites_a_changed_line("sync.rs has the wrong premise", &hunks()));
+        assert!(!cites_a_changed_line("retry_count is never decremented", &hunks()));
+    }
+
+    #[test]
+    fn an_unrelated_file_does_not_count() {
+        assert!(!cites_a_changed_line("other.rs:88 disagrees", &hunks()));
     }
 }

@@ -5,7 +5,7 @@
 //! be broken in the UI — a call in flight, each verdict, a failure — are exactly
 //! the ones a real judge makes slow and expensive to reach.
 
-use super::{Context, Generated, Generator, Judge, Label, Verdict};
+use super::{Context, Disputed, Generated, Generator, Judge, Label, Verdict};
 use anyhow::{bail, Result};
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -98,13 +98,22 @@ pub struct StubJudge {
     pub script: Mutex<VecDeque<Option<Label>>>,
     /// Simulated latency, so the "grading…" state is observable.
     pub delay: Duration,
+    /// What to rule on a dispute. `None` — the only thing `--offline` ever
+    /// produces — rejects it; the upheld paths exist for tests, since a
+    /// stand-in that waived questions would make `--offline` a way to clear a
+    /// gate without answering anything.
+    pub dispute_ruling: Option<String>,
 }
 
 impl Default for StubJudge {
     /// Length-based, matching the old behaviour: a real attempt passes, a
     /// one-liner does not.
     fn default() -> Self {
-        Self { script: Mutex::new(VecDeque::new()), delay: Duration::ZERO }
+        Self {
+            script: Mutex::new(VecDeque::new()),
+            delay: Duration::ZERO,
+            dispute_ruling: None,
+        }
     }
 }
 
@@ -113,7 +122,15 @@ impl StubJudge {
         Self {
             script: Mutex::new(labels.into_iter().collect()),
             delay: Duration::ZERO,
+            dispute_ruling: None,
         }
+    }
+
+    /// Uphold every dispute with this kind. Tests only.
+    #[cfg(test)]
+    pub fn upholding(mut self, kind: &str) -> Self {
+        self.dispute_ruling = Some(kind.to_string());
+        self
     }
 
     pub fn with_delay(mut self, delay: Duration) -> Self {
@@ -154,6 +171,24 @@ impl Judge for StubJudge {
             None => Ok(Verdict {
                 label: Label::Restates,
                 feedback: "[offline] too short to be a real answer.".into(),
+            }),
+        }
+    }
+
+    fn dispute(&self, _question: &str, _reference: &str, _claim: &str) -> Result<Disputed> {
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        match &self.dispute_ruling {
+            Some(kind) => Ok(Disputed {
+                upheld: true,
+                kind: kind.clone(),
+                feedback: format!("[offline] scripted ruling: upheld as {kind}"),
+            }),
+            None => Ok(Disputed {
+                upheld: false,
+                kind: String::new(),
+                feedback: "[offline] disputes are not judged without a model.".into(),
             }),
         }
     }

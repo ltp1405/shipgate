@@ -35,6 +35,14 @@ pub enum AppEvent {
         question_id: i64,
         error: String,
     },
+    /// §8 dispute: the judge's ruling on a claim that the question, its
+    /// reference answer or the code is wrong.
+    Disputed {
+        question_id: i64,
+        upheld: bool,
+        kind: String,
+        feedback: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,6 +84,12 @@ pub struct Slot {
     pub hints_shown: usize,
     pub verdict: Option<(llm::Label, String)>,
     pub pending: Option<Pending>,
+    /// The claim currently with the judge, held for the same reason `pending`
+    /// is: the ruling is recorded against what was actually argued.
+    pub dispute: Option<String>,
+    /// What the judge made of a dispute, shown under the verdict. Separate from
+    /// `verdict` because a rejected dispute leaves the grade untouched.
+    pub note: Option<String>,
 }
 
 pub struct App {
@@ -139,6 +153,11 @@ impl App {
         self.slot().verdict.as_ref()
     }
 
+    /// What the judge made of a dispute on this question, if there was one.
+    pub fn slot_note(&self) -> Option<&str> {
+        self.slot().note.as_deref()
+    }
+
     /// The mode is a view of the current question's slot, not a state machine
     /// of its own: with several questions in flight at once there is no single
     /// thing the app is doing.
@@ -153,10 +172,27 @@ impl App {
         }
     }
 
-    /// Judge calls still out. The quiz cannot end while any of these are
-    /// outstanding — the score is not known and the attempt is not recorded.
+    /// Judge calls still out, grading and disputes alike. The quiz cannot end
+    /// while any of these are outstanding — the score is not known and the
+    /// attempt is not recorded.
     pub fn in_flight(&self) -> usize {
-        self.slots.iter().filter(|s| s.pending.is_some()).count()
+        self.slots
+            .iter()
+            .filter(|s| s.pending.is_some() || s.dispute.is_some())
+            .count()
+    }
+
+    /// The scores the pass rule sees. A question taken out of the quiz by an
+    /// upheld dispute is not a score of zero — it is not a score. Leaving it in
+    /// would let the judge's own mistake block the gate, which is the thing
+    /// disputing exists to undo.
+    pub fn scoreable(&self) -> Vec<f64> {
+        self.questions
+            .iter()
+            .zip(&self.scores)
+            .filter(|(q, _)| q.status != "waived" && q.status != "deferred")
+            .map(|(_, s)| *s)
+            .collect()
     }
 
     /// One marker per question, for the pane footer: what is done, what is
@@ -167,8 +203,10 @@ impl App {
             .zip(&self.questions)
             .enumerate()
             .map(|(i, (slot, q))| {
-                let mark = if slot.pending.is_some() {
+                let mark = if slot.pending.is_some() || slot.dispute.is_some() {
                     '~'
+                } else if q.status == "waived" || q.status == "deferred" {
+                    '!'
                 } else if q.status == "passed" {
                     '+'
                 } else if slot.verdict.is_some() {
@@ -190,7 +228,7 @@ impl App {
     pub fn first_unanswered(questions: &[db::Question]) -> usize {
         questions
             .iter()
-            .position(|q| q.status != "passed")
+            .position(|q| !is_settled(&q.status))
             .unwrap_or(0)
     }
 
@@ -199,7 +237,7 @@ impl App {
         questions.iter().map(|q| q.score.unwrap_or(0.0)).collect()
     }
 
-    /// The next question that still needs you: not passed, and not already
+    /// The next question that still needs you: not settled, and not already
     /// sitting with the judge. Searches past the current question first, then
     /// wraps, since submitting out of order is now normal.
     fn next_unanswered(&self) -> Option<usize> {
@@ -207,7 +245,7 @@ impl App {
             return None;
         }
         let needs = |i: usize| {
-            self.questions[i].status != "passed"
+            !is_settled(&self.questions[i].status)
                 && self.slots.get(i).is_none_or(|s| s.pending.is_none())
         };
         let n = self.questions.len();
@@ -286,6 +324,13 @@ impl App {
     }
 }
 
+/// A question nobody is going to answer again: passed, or taken out of the quiz
+/// by an upheld dispute. `waived` was the question's own fault and `deferred`
+/// is a bug the code owes you — neither is a score you can earn.
+pub fn is_settled(status: &str) -> bool {
+    matches!(status, "passed" | "waived" | "deferred")
+}
+
 /// Mark each diff line with whether its hunk is AI-authored.
 ///
 /// Keyed on `(file, header)`, not the header alone: `@@ -1,1 +1,2 @@` recurs
@@ -349,10 +394,11 @@ fn build_diff_view(diff: &str, ai_hunks: &[git::Hunk]) -> Vec<DiffLine> {
 }
 
 const STATUS_ANSWERING: &str =
-    "a answer · h hint · tab/1-9 question · n/p hunk · [/] file · g back · q quit";
+    "a answer · h hint · d dispute · tab/1-9 question · n/p hunk · g back · q quit";
 const STATUS_ANSWERED: &str =
-    "^s submit & move on · e revise · h hint · tab/1-9 question · g back · q quit";
-const STATUS_REVIEWING: &str = "space next · tab/1-9 question · e revise · g back · q quit";
+    "^s submit & move on · e revise · h hint · d dispute · tab/1-9 question · q quit";
+const STATUS_REVIEWING: &str =
+    "space next · e revise · d dispute · tab/1-9 question · g back · q quit";
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -499,7 +545,7 @@ pub fn run(
     );
     restore(&mut terminal)?;
     result?;
-    Ok(app.scores)
+    Ok(app.scoreable())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -583,10 +629,53 @@ fn event_loop(
                     };
                 }
                 AppEvent::Failed { question_id, error } => {
+                    // Which call failed is what the reviewer needs to know:
+                    // a failed dispute leaves the question standing, a failed
+                    // grading leaves the answer unsubmitted.
+                    let mut what = "grading";
                     if let Some(i) = app.questions.iter().position(|q| q.id == question_id) {
+                        if app.slots[i].dispute.take().is_some() {
+                            what = "the dispute";
+                        }
                         app.slots[i].pending = None;
                     }
-                    app.status = format!("grading failed: {error}");
+                    app.status = format!("{what} failed: {error}");
+                }
+                AppEvent::Disputed { question_id, upheld, kind, feedback } => {
+                    let Some(i) = app.questions.iter().position(|q| q.id == question_id)
+                    else {
+                        continue;
+                    };
+                    let claim = app.slots[i].dispute.take().unwrap_or_default();
+                    db::record_dispute(
+                        conn, question_id, &claim, upheld, &kind, &feedback, judge.model(),
+                    )?;
+
+                    // §8: an upheld `code_bug` does not pass the question and
+                    // does not block the gate. It opens an obligation, and the
+                    // question leaves the quiz either way — there is no answer
+                    // to a question whose premise just failed.
+                    let status = match (upheld, kind.as_str()) {
+                        (true, "code_bug") => {
+                            db::open_obligation(conn, question_id, &claim)?;
+                            "deferred"
+                        }
+                        (true, _) => "waived",
+                        (false, _) => "open",
+                    };
+                    if upheld {
+                        db::set_question_status(conn, question_id, status)?;
+                        app.questions[i].status = status.into();
+                    }
+                    app.slots[i].note = Some(format!(
+                        "dispute {}: {feedback}",
+                        if upheld { format!("upheld ({kind})") } else { "rejected".into() }
+                    ));
+                    app.status = if upheld {
+                        format!("question {} {status}", i + 1)
+                    } else {
+                        format!("dispute on question {} rejected", i + 1)
+                    };
                 }
             }
         }
@@ -692,6 +781,13 @@ fn event_loop(
                 }
             }
 
+            // §8 dispute. Not gated on having answered: a question whose
+            // premise is wrong is worth saying so before you spend an answer
+            // on it.
+            (KeyCode::Char('d'), _) => {
+                dispute(ui, app, conn, judge, ai_hunks, tx)?;
+            }
+
             (KeyCode::Char('s'), _) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if app.mode() == Mode::Grading {
                     app.status = "already grading this one".into();
@@ -712,6 +808,105 @@ fn event_loop(
             _ => {}
         }
     }
+}
+
+/// §8 — argue that the question, its reference answer or the code is wrong.
+///
+/// Every guard that can run locally runs before the call: disputing is cheap
+/// for the reviewer and upholding is not, and v1's free dispute became the way
+/// past any question worth thinking about.
+#[allow(clippy::too_many_arguments)]
+fn dispute(
+    ui: &mut Editor,
+    app: &mut App,
+    conn: &Connection,
+    judge: &Arc<dyn llm::Judge + Send + Sync>,
+    ai_hunks: &[git::Hunk],
+    tx: &Sender<AppEvent>,
+) -> Result<()> {
+    let Some(q) = app.question().cloned() else { return Ok(()) };
+    if app.slot().dispute.is_some() {
+        app.status = "that dispute is already with the judge".into();
+        return Ok(());
+    }
+    if is_settled(&q.status) {
+        app.status = format!("question {} is already settled", app.current + 1);
+        return Ok(());
+    }
+
+    let (per_question, per_gate) = db::dispute_counts(conn, q.id)?;
+    if per_question >= 1 {
+        app.status = "one dispute per question".into();
+        return Ok(());
+    }
+    if per_gate >= 2 {
+        app.status = "two disputes per gate — answer this one".into();
+        return Ok(());
+    }
+
+    let claim = ui.edit("", &dispute_header(app))?;
+    if claim.trim().is_empty() {
+        app.status = "nothing to dispute".into();
+        return Ok(());
+    }
+    // Local, so a claim that names nothing costs nothing.
+    if !llm::cites_a_changed_line(&claim, ai_hunks) {
+        app.status = "a dispute must quote a changed line, like sync.rs:88".into();
+        return Ok(());
+    }
+
+    app.status = "disputing…".into();
+    if let Some(slot) = app.slot_mut() {
+        slot.dispute = Some(claim.clone());
+        slot.note = None;
+    }
+
+    let tx = tx.clone();
+    let judge = Arc::clone(judge);
+    let (id, text, reference) = (q.id, q.text.clone(), q.reference.clone());
+    std::thread::spawn(move || {
+        let ev = match judge.dispute(&text, &reference, &claim) {
+            Ok(d) => AppEvent::Disputed {
+                question_id: id,
+                upheld: d.upheld,
+                kind: d.kind,
+                feedback: d.feedback,
+            },
+            Err(e) => AppEvent::Failed { question_id: id, error: e.to_string() },
+        };
+        let _ = tx.send(ev);
+    });
+    Ok(())
+}
+
+/// The `#` block above a dispute. States the question and what the judge will
+/// hold the claim to — never the reference answer, which is what half the
+/// disputes are about and would turn disputing into a way to read it.
+fn dispute_header(app: &App) -> String {
+    let Some(q) = app.question() else { return String::new() };
+    let mut out = format!(
+        "# Disputing question {}/{} · {} · {}\n#\n",
+        app.current + 1,
+        app.questions.len(),
+        q.kind,
+        q.file
+    );
+    for line in wrap_comment(&q.text) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str("#\n");
+    for line in wrap_comment(
+        "Say what is wrong: the question assumes something the code does not do \
+         (premise), the stored answer is wrong (reference), or the code itself is \
+         wrong (code_bug). Quote a changed line — file.rs:88 — or the claim is \
+         refused before it costs anything. Upholding is deliberately hard.",
+    ) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str("#\n# The `#` block at the end of this file is stripped.\n");
+    out
 }
 
 /// Move to question `i`, wrapping. Unlike `advance` this goes wherever it is
@@ -1082,6 +1277,7 @@ diff --git a/sync.rs b/sync.rs
         match rx.recv().unwrap() {
             AppEvent::Graded { label, .. } => assert_eq!(label, Label::Wrong),
             AppEvent::Failed { error, .. } => panic!("reached the judge: {error}"),
+            AppEvent::Disputed { .. } => panic!("a submit produced a dispute ruling"),
         }
         drop(conn);
     }
@@ -1276,6 +1472,130 @@ diff --git a/sync.rs b/sync.rs
         assert_eq!(app.current, 0);
         assert!(app.status.contains("with the judge"), "status: {}", app.status);
         drop(conn);
+    }
+
+    /// A rejected dispute is recorded and changes nothing: the verdict you were
+    /// arguing with stands, and the question is still yours to answer.
+    #[test]
+    fn a_rejected_dispute_is_recorded_and_leaves_the_question_open() {
+        let (conn, hunks, questions) = fixture(1);
+        let id = questions[0].id;
+        let app = run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::default()),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('d')],
+            true,
+        )
+        .unwrap();
+
+        let (per_question, _) = db::dispute_counts(&conn, id).unwrap();
+        assert_eq!(per_question, 1, "the dispute was not recorded");
+        let label: String = conn
+            .query_row(
+                "SELECT label FROM attempts WHERE mode = 'dispute'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(label, "rejected");
+        assert_eq!(app.questions[0].status, "open");
+        assert!(app.slots[0].note.as_deref().unwrap().contains("rejected"));
+    }
+
+    /// An upheld premise takes the question out of the quiz. It must not leave
+    /// a zero behind: the judge's own mistake blocking the gate is the thing
+    /// disputing exists to undo.
+    #[test]
+    fn an_upheld_dispute_waives_the_question_and_its_score() {
+        let (conn, hunks, questions) = fixture(2);
+        let app = run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::default().upholding("premise")),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('d')],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(app.questions[0].status, "waived");
+        assert_eq!(app.scoreable().len(), 1, "the waived question is still scored");
+        let stored: String = conn
+            .query_row("SELECT status FROM questions ORDER BY id LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, "waived");
+    }
+
+    /// §8: a code bug does not pass the question and does not block the gate.
+    /// It opens an obligation, which is what stops "the code is wrong" being a
+    /// free skip.
+    #[test]
+    fn an_upheld_code_bug_defers_the_question_and_opens_an_obligation() {
+        let (conn, hunks, questions) = fixture(1);
+        let app = run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::default().upholding("code_bug")),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('d')],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(app.questions[0].status, "deferred");
+        assert_eq!(db::open_obligations(&conn, "o/r").unwrap().len(), 1);
+    }
+
+    /// Disputing is cheap and upholding is not, so the caps are what keep it
+    /// from becoming the way past every question.
+    #[test]
+    fn a_question_takes_one_dispute_and_a_gate_takes_two() {
+        let (conn, hunks, questions) = fixture(3);
+        let app = run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::default()),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            // Two on the first question, then one each on the next two.
+            vec![key('d'), key('d'), key('2'), key('d'), key('3'), key('d')],
+            true,
+        )
+        .unwrap();
+
+        let disputes: i64 = conn
+            .query_row("SELECT count(*) FROM attempts WHERE mode = 'dispute'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(disputes, 2, "the caps did not hold");
+        assert!(app.status.contains("two disputes per gate"), "status: {}", app.status);
+    }
+
+    /// A question already out of the quiz cannot be disputed again — there is
+    /// nothing left to argue about, and it would burn the gate's second slot.
+    #[test]
+    fn a_settled_question_cannot_be_disputed() {
+        let (conn, hunks, mut questions) = fixture(1);
+        questions[0].status = "passed".into();
+        let app = run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::default()),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('d')],
+            true,
+        )
+        .unwrap();
+        assert!(app.status.contains("already settled"), "status: {}", app.status);
+        let disputes: i64 = conn
+            .query_row("SELECT count(*) FROM attempts WHERE mode = 'dispute'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(disputes, 0);
     }
 
     #[test]

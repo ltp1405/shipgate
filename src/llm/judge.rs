@@ -1,6 +1,6 @@
 //! §8 — grading. The reference answer is deliberately absent from this context.
 
-use super::{cli, Judge, Label, Verdict};
+use super::{cli, Disputed, Judge, Label, Verdict};
 use anyhow::Result;
 use serde::Deserialize;
 
@@ -68,11 +68,20 @@ struct Graded {
     feedback: String,
 }
 
+/// The dispute reply as it comes off the wire. `reasoning` is in the shape so
+/// the model has to ground the claim before it commits to upholding it; nothing
+/// reads it.
 #[derive(Deserialize)]
-pub struct Disputed {
-    pub upheld: bool,
-    pub kind: String,
-    pub feedback: String,
+struct DisputeReply {
+    #[allow(dead_code)]
+    #[serde(default)]
+    reasoning: String,
+    #[serde(default)]
+    upheld: bool,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    feedback: String,
 }
 
 /// Stated in the prompt rather than enforced — the CLI has no schema support.
@@ -124,7 +133,7 @@ impl CliJudge {
         Ok(serde_json::from_value(value)?)
     }
 
-    pub fn dispute(&self, question: &str, reference: &str, claim: &str) -> Result<Disputed> {
+    fn dispute_once(&self, question: &str, reference: &str, claim: &str) -> Result<DisputeReply> {
         let system = format!(
             "{DISPUTE_SYSTEM}\n\n# Reply with exactly this shape\n\n{DISPUTE_SHAPE}\n\n# The diff\n\n{}",
             self.diff
@@ -139,6 +148,18 @@ impl CliJudge {
 }
 
 impl Judge for CliJudge {
+    fn dispute(&self, question: &str, reference: &str, claim: &str) -> Result<Disputed> {
+        let r = self.dispute_once(question, reference, claim)?;
+        // An upheld dispute with no kind would silently become `premise`, which
+        // is the one that drops the question. Unrecognised means not upheld.
+        let known = matches!(r.kind.as_str(), "premise" | "reference" | "code_bug");
+        Ok(Disputed {
+            upheld: r.upheld && known,
+            kind: r.kind,
+            feedback: r.feedback,
+        })
+    }
+
     fn judge(&self, _diff: &str, question: &str, answer: &str) -> Result<Verdict> {
         let first = self.grade_once(question, answer)?;
         let label = parse_label(&first.label);

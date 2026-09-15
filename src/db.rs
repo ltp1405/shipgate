@@ -548,6 +548,84 @@ pub fn prune_closed(conn: &Connection, repo: &str, open_prs: &[u64]) -> Result<u
     Ok(removed)
 }
 
+/// §8 — a dispute, upheld or not, recorded against the question it was about.
+///
+/// Written as an attempt with `mode = 'dispute'` and no score, and it does not
+/// touch the question's label: a rejected dispute leaves the verdict you were
+/// arguing with exactly where it was, and an upheld one changes the question's
+/// *status*, not its grade.
+pub fn record_dispute(
+    conn: &Connection,
+    question_id: i64,
+    body: &str,
+    upheld: bool,
+    kind: &str,
+    feedback: &str,
+    judge_model: &str,
+) -> Result<()> {
+    let label = if upheld { kind } else { "rejected" };
+    conn.execute(
+        "INSERT INTO attempts
+           (question_id, mode, body, hints_used, label, score, feedback, judge_model, created_at)
+         VALUES (?1,'dispute',?2,0,?3,NULL,?4,?5,?6)",
+        params![question_id, body, label, feedback, judge_model, now()],
+    )?;
+    Ok(())
+}
+
+/// How many disputes a question has already had, and how many its gate has.
+/// §8 caps both — one per question, two per gate — because v1 made disputing
+/// free and it became the way past any question worth thinking about.
+pub fn dispute_counts(conn: &Connection, question_id: i64) -> Result<(i64, i64)> {
+    let per_question: i64 = conn.query_row(
+        "SELECT count(*) FROM attempts WHERE question_id = ?1 AND mode = 'dispute'",
+        params![question_id],
+        |r| r.get(0),
+    )?;
+    let per_gate: i64 = conn.query_row(
+        "SELECT count(*) FROM attempts a
+         JOIN questions q ON q.id = a.question_id
+         WHERE a.mode = 'dispute'
+           AND q.gate_id = (SELECT gate_id FROM questions WHERE id = ?1)",
+        params![question_id],
+        |r| r.get(0),
+    )?;
+    Ok((per_question, per_gate))
+}
+
+/// The claim behind the most recent dispute on a question, for the PR
+/// description.
+pub fn last_dispute(conn: &Connection, question_id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT body FROM attempts WHERE question_id = ?1 AND mode = 'dispute'
+             ORDER BY id DESC LIMIT 1",
+            params![question_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+pub fn set_question_status(conn: &Connection, question_id: i64, status: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE questions SET status = ?1 WHERE id = ?2",
+        params![status, question_id],
+    )?;
+    Ok(())
+}
+
+/// §8 — an upheld `code_bug` does not pass the question and does not block the
+/// gate. It opens an obligation, settled by fixing the bug or withdrawing the
+/// claim before the next gate on this repo clears.
+pub fn open_obligation(conn: &Connection, question_id: i64, body: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO obligations (gate_id, question_id, body, created_at)
+         SELECT gate_id, id, ?2, ?3 FROM questions WHERE id = ?1",
+        params![question_id, body, now()],
+    )?;
+    Ok(())
+}
+
 pub struct Obligation {
     pub pr_number: u64,
     pub body: String,

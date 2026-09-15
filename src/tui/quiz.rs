@@ -171,6 +171,14 @@ fn render_question(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    if let Some(note) = &app.slot_note() {
+        top.push(Line::from(""));
+        top.push(Line::from(Span::styled(
+            note.to_string(),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+
     let title = format!(
         " {}/{} · {} · {} ",
         app.current + 1,
