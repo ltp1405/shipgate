@@ -417,6 +417,8 @@ Whatever they are set to, the two must differ: §8 rests on the grader not being
 
 An earlier draft of this section estimated $0.03–0.10 per PR from token counts alone. That was wrong by more than an order of magnitude, for two reasons it did not account for:
 
+**A stored gate replays; it does not regenerate.** `shipgate ready` on a PR that has been quizzed before re-runs the stored questions against the stored diff and calls the generator not at all. Re-running to look at the quiz again is the common case, and at $0.52 a generation, charging for it would make reopening a gate the most expensive thing in the tool. `--force` throws the gate away — questions and graded answers both — and generates a new one. The cost of the default is that new commits are not covered until you ask: the replay warns when HEAD has moved past the stored gate.
+
 Remaining levers, in order of value: ask for fewer questions; keep the precheck, which is free and killed five of six answers in the run above; and remember the bill scales with **PR count**, not repo size — a busy backlog is where this bites, not a large codebase.
 
 Against the time a PR takes to review, this is small either way — but it is not free, and it scales with PR count, not repo size. The comparison that matters is proportional, so it survives the billing question: v1's Stop hook fired at every Claude Code turn end, so 10–25 gates a day would consume **10–25× what the PR-ready gate does**. On an API key that is $15–35/day; on a subscription it is the difference between a gate you barely notice and one that exhausts your limits by lunchtime. Either way it settles the placement question independently of the ergonomics argument.

@@ -31,15 +31,12 @@ enum Command {
         /// Run the quiz but touch nothing on GitHub.
         #[arg(long)]
         dry_run: bool,
-        /// Replay the stored questions for this PR instead of generating new
-        /// ones. Free, and keeps the questions stable while you iterate.
-        #[arg(long)]
-        reuse: bool,
         /// Use offline stand-ins instead of the model. No cost, no network.
         #[arg(long)]
         offline: bool,
-        /// Generate new questions even though the stored gate holds graded
-        /// answers, discarding them.
+        /// Throw away the stored gate — questions and graded answers both —
+        /// and generate new questions. Without it a PR that has been quizzed
+        /// before replays the questions it already has, which costs nothing.
         #[arg(long)]
         force: bool,
     },
@@ -52,8 +49,8 @@ fn main() -> Result<()> {
     let cwd = std::env::current_dir()?;
     match cli.command.unwrap_or(Command::Dash) {
         Command::Dash => gate::dashboard(),
-        Command::Ready { dry_run, reuse, offline, force } => {
-            gate::Ready { dry_run, reuse, offline, force }.run(&cwd)
+        Command::Ready { dry_run, offline, force } => {
+            gate::Ready { dry_run, offline, force }.run(&cwd)
         }
         Command::Status => gate::status(&cwd),
     }

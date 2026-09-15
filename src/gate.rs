@@ -65,12 +65,11 @@ pub struct Ready {
     pub dry_run: bool,
     /// Use the offline stand-ins instead of the model. No cost, no network.
     pub offline: bool,
-    /// Regenerate even though the stored gate holds graded answers.
+    /// Throw away the stored gate and generate a new one. Without it a PR that
+    /// has been quizzed before replays what it already has: generation is the
+    /// expensive half of a run, and the questions are worth keeping stable
+    /// while you work through them.
     pub force: bool,
-    /// Replay the stored gate instead of generating. Generation is the
-    /// expensive half, so without this every look at the quiz costs a model
-    /// call.
-    pub reuse: bool,
 }
 
 impl Ready {
@@ -96,29 +95,33 @@ impl Ready {
             config::fallback_base(&dir, &repo, &cfg)?
         };
 
-        // Replaying uses the stored snapshot, so none of the HEAD-derived work
-        // below applies.
+        // A stored gate is replayed, not regenerated. Generation is the
+        // expensive half of a run — the whole diff through the generator — and
+        // re-running `shipgate ready` to look at the quiz again is the common
+        // case, not the rare one. Replaying uses the stored snapshot, so none
+        // of the HEAD-derived work below applies.
         let conn = db::open()?;
-        if self.reuse {
-            return self.replay(&conn, &dir, &pr, &repo, &branch, &base_ref);
+        let stored = db::gate_for_pr(&conn, &repo, pr.number)?;
+        if !self.force {
+            if let Some(gate) = &stored {
+                if !db::questions_for(&conn, gate.id)?.is_empty() {
+                    return self.replay(&conn, &dir, &pr, &repo, &branch, &base_ref);
+                }
+            }
         }
 
-        // Refuse to throw away graded work. Questions cascade from the gate and
-        // attempts from the questions, so regenerating deletes every answer you
-        // have already been graded on. Checked before generating, so the refusal
-        // costs nothing.
-        if !self.force {
-            if let Some(existing) = db::gate_for_pr(&conn, &repo, pr.number)? {
-                let answered = db::attempt_count(&conn, existing.id)?;
-                if answered > 0 {
-                    bail!(
-                        "{repo}#{} already has {answered} graded answer{} — regenerating would \
-                         delete them.\n  --reuse   continue with the stored questions\n  \
-                         --force   discard them and generate new ones",
-                        pr.number,
-                        if answered == 1 { "" } else { "s" }
-                    );
-                }
+        // Generating replaces the stored gate outright: questions cascade from
+        // the gate and attempts from the questions, so every graded answer goes
+        // with it. Say how much is being thrown away rather than doing it
+        // quietly — asking for it is what --force means.
+        if let Some(gate) = &stored {
+            let answered = db::attempt_count(&conn, gate.id)?;
+            if answered > 0 {
+                eprintln!(
+                    "warning: discarding {answered} graded answer{} on {repo}#{}",
+                    if answered == 1 { "" } else { "s" },
+                    pr.number
+                );
             }
         }
 
@@ -314,13 +317,13 @@ impl Ready {
         base_ref: &str,
     ) -> Result<()> {
         let Some(gate) = db::gate_for_pr(conn, repo, pr.number)? else {
-            bail!("no stored gate for {repo}#{} — run without --reuse first", pr.number);
+            bail!("no stored gate for {repo}#{} — run with --force to generate one", pr.number);
         };
         let questions = db::questions_for(conn, gate.id)?;
         if questions.is_empty() {
             bail!(
                 "the stored gate for {repo}#{} has no questions (state: {}) — \
-                 run without --reuse first",
+                 run with --force to generate a new one",
                 pr.number,
                 gate.state
             );
@@ -351,8 +354,14 @@ impl Ready {
             pr.number,
             &gate.head_sha[..7.min(gate.head_sha.len())]
         );
+        // The stored questions belong to the stored diff. Whatever has been
+        // pushed since is not being quizzed, and saying so is the difference
+        // between a cheap replay and a gate that quietly covers old code.
         if gate.head_sha != git::rev_parse(dir, "HEAD")? {
-            eprintln!("note: HEAD has moved since this gate was created");
+            eprintln!(
+                "warning: HEAD has moved since this gate was created — these questions \
+                 cover the stored diff, not your new commits. --force regenerates."
+            );
         }
         println!("\n{coverage}\n");
 
@@ -619,15 +628,9 @@ pub fn dashboard() -> Result<()> {
         return Ok(());
     };
 
-    // An existing gate is replayed; a PR with none is quizzed from scratch.
-    let reuse = !matches!(row.status, dash::Status::Ungated);
-    Ready {
-        dry_run: false,
-        reuse,
-        offline: false,
-        force: false,
-    }
-    .run(&row.path)
+    // An existing gate is replayed and a PR with none is quizzed from scratch,
+    // which is what `ready` does by default.
+    Ready { dry_run: false, offline: false, force: false }.run(&row.path)
 }
 
 /// §11 — the soft teeth. Lists PRs that went ready without a gate.
