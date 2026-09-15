@@ -64,10 +64,43 @@ const INTERCEPTORS: &[&str] = &[
     "abort", "redirect_to", "goto",
 ];
 
+/// Keywords that open a declaration. A change that adds one of these adds new
+/// surface; it cannot have got in front of anything that was already running.
+const DECLARES: &[&str] = &[
+    "fn", "def", "class", "func", "struct", "enum", "trait", "impl", "interface",
+    "module", "type", "const",
+];
+
 /// Lines that dispatch — the thing a guard placed above them can shadow.
 const DISPATCH: &[&str] = &[
-    "match ", "=>", "if ", "elsif", "elif", "else", "when ", "case ", "switch",
+    "match", "if", "elsif", "elif", "else", "when", "case", "switch",
 ];
+
+/// Extensions whose contents are prose or data, where the keyword scan below
+/// reads paragraphs as control flow — "a model can return an anchor" is not a
+/// guard, and the sentences after it are not dispatch.
+const NOT_CODE: &[&str] = &[
+    "md", "markdown", "txt", "rst", "adoc", "org", "csv", "tsv", "json", "yaml",
+    "yml", "toml", "lock", "ini", "cfg", "sql", "svg",
+];
+
+/// Keyword match on word boundaries. `contains` alone reads `returns` in a
+/// sentence and `next` inside `context` as control flow.
+fn has_word(line: &str, word: &str) -> bool {
+    let boundary = |c: char| !(c.is_alphanumeric() || c == '_');
+    let mut from = 0;
+    while let Some(off) = line[from..].find(word) {
+        let start = from + off;
+        let end = start + word.len();
+        let before = line[..start].chars().next_back().is_none_or(boundary);
+        let after = line[end..].chars().next().is_none_or(boundary);
+        if before && after {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
 
 /// Parse the new-side start out of `@@ -12,3 +88,9 @@`.
 fn new_start(header: &str) -> Option<usize> {
@@ -85,62 +118,106 @@ fn new_start(header: &str) -> Option<usize> {
 /// stopped happening is somewhere below them in a file the generator would
 /// otherwise never see.
 pub fn shadowed(dir: &Path, hunks: &[git::Hunk]) -> Result<Vec<String>> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
     let mut out = Vec::new();
 
     for h in hunks {
+        let ext = Path::new(&h.file)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        if NOT_CODE.contains(&ext.as_str()) {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(dir.join(&h.file)) else { continue };
         let lines: Vec<&str> = text.lines().collect();
 
-        let added: HashSet<&str> =
-            h.added.iter().map(|l| l.trim_start_matches('+').trim()).collect();
-
-        // The guard: an added line that stops flow. The first one is enough —
-        // a hunk with several is still one story about what now comes first.
-        let Some(guard) = h
+        let added: Vec<&str> = h
             .added
             .iter()
-            .map(|l| l.trim_start_matches('+'))
-            .find(|l| {
-                let t = l.trim();
-                !t.starts_with("//") && INTERCEPTORS.iter().any(|k| t.contains(k))
-            })
-        else {
-            continue;
-        };
+            .map(|l| l.trim_start_matches('+').trim())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let added_set: HashSet<&&str> = added.iter().collect();
 
-        // Where that guard landed. The header's new-side start is the estimate;
-        // the content is what confirms it, since an earlier hunk in the same
-        // file shifts every line below it.
+        // Does this hunk stop or divert flow at all? The line that does it is
+        // usually buried inside the guard it belongs to — `return` sits under
+        // the `if` that decides it — so it marks the hunk as a candidate
+        // rather than marking the position to read from.
+        let intercepts = added.iter().any(|t| {
+            !t.starts_with("//")
+                && !t.starts_with('#')
+                && INTERCEPTORS.iter().any(|k| has_word(t, k))
+        });
+        if !intercepts {
+            continue;
+        }
+
+        // Where the hunk landed. The header's new-side start is the estimate;
+        // the content confirms it, since an earlier hunk in the same file
+        // shifts every line below it.
         let Some(from) = new_start(&h.header) else { continue };
-        let Some(at) = lines
-            .iter()
-            .enumerate()
-            .skip(from.saturating_sub(1))
-            .find(|(_, l)| l.trim() == guard.trim())
-            .map(|(i, _)| i)
-        else {
-            continue;
+        let find = |needle: &str, after: usize| {
+            lines
+                .iter()
+                .enumerate()
+                .skip(after)
+                .find(|(_, l)| l.trim() == needle)
+                .map(|(i, _)| i)
         };
+        let Some(first) = find(added[0], from.saturating_sub(1)) else { continue };
+        let last = added
+            .iter()
+            .rev()
+            .find_map(|t| find(t, first))
+            .unwrap_or(first);
 
-        let indent = |l: &str| l.len() - l.trim_start().len();
-        let depth = indent(lines[at]);
+        // The floor is the outermost line the change added, not the line that
+        // returns. What a guard shadows sits at the level the guard was
+        // inserted at; reading from the `return` would stop at its own closing
+        // brace and see nothing.
+        let floor = added
+            .iter()
+            .filter_map(|t| find(t, first).map(|i| indent(lines[i])))
+            .min()
+            .unwrap_or_else(|| indent(lines[first]));
 
-        // Downward until the block the guard sits in ends. Dedenting past the
-        // guard means the dispatch below is no longer something it precedes.
+        // A hunk whose outermost added line opens a declaration is a new
+        // function, not a guard in front of an old one. Reading on would walk
+        // out of it and report the next declaration's dispatch as shadowed.
+        let outermost = added
+            .iter()
+            .filter_map(|t| find(t, first).map(|i| (indent(lines[i]), *t)))
+            .filter(|(d, _)| *d == floor)
+            .map(|(_, t)| t)
+            .next()
+            .unwrap_or(added[0]);
+        if DECLARES.iter().any(|k| has_word(outermost, k)) {
+            continue;
+        }
+
+        // Downward until the block the change was inserted into ends.
         let mut below = Vec::new();
-        for (i, line) in lines.iter().enumerate().skip(at + 1).take(60) {
+        for (i, line) in lines.iter().enumerate().skip(last + 1).take(80) {
             let t = line.trim();
             if t.is_empty() {
                 continue;
             }
-            if indent(line) < depth {
+            if indent(line) < floor {
+                break;
+            }
+            // A sibling declaration at the same level: past the end of whatever
+            // the change was inserted into, so nothing below it was shadowed.
+            if indent(line) == floor && DECLARES.iter().any(|k| has_word(t, k)) {
                 break;
             }
             // Lines this change added are not what it shadowed.
-            if added.contains(t) {
+            if added_set.contains(&t) {
                 continue;
             }
-            if DISPATCH.iter().any(|k| t.contains(k)) {
+            // `=>` is punctuation and has no word boundary; the rest are words.
+            if t.contains("=>") || DISPATCH.iter().any(|k| has_word(t, k)) {
                 below.push(format!("{}: {t}", i + 1));
             }
             if below.len() == 8 {
@@ -156,11 +233,15 @@ pub fn shadowed(dir: &Path, hunks: &[git::Hunk]) -> Result<Vec<String>> {
         }
 
         out.push(format!(
-            "# `{}:{}` runs before what follows it\n{}: {}",
+            "# `{}:{}` runs before what follows it\n{}",
             h.file,
-            at + 1,
-            at + 1,
-            lines[at].trim()
+            first + 1,
+            added
+                .iter()
+                .take(6)
+                .map(|t| format!("   {t}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
         out.extend(below);
     }
@@ -268,8 +349,17 @@ fn handle(key: Key) -> Result<()> {
             DISPATCHER,
             "    if is_quit(key) { return Ok(()); }\n        Key::Up => scroll(-1),",
         );
+        // The guard itself is echoed back as a preview, so the check is on the
+        // numbered lines below it — those are the ones offered as shadowed.
         let out = shadowed(dir.path(), &h).unwrap();
-        assert!(!out.join("\n").contains("Key::Up"), "{out:?}");
+        let reported: Vec<&String> = out
+            .iter()
+            .filter(|l| l.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .collect();
+        assert!(
+            !reported.iter().any(|l| l.contains("Key::Up")),
+            "a line the change added was reported as shadowed: {reported:?}"
+        );
     }
 
     /// A guard with nothing but its own else-branch under it is not a shadow.
@@ -310,6 +400,78 @@ fn elsewhere(x: u8) {
 ";
         let (dir, h) = shadow_fixture(file, "    if is_quit(key) { return Ok(()); }");
         assert!(shadowed(dir.path(), &h).unwrap().is_empty());
+    }
+
+    /// The real case this kind was built for: a prompt branch added above a key
+    /// dispatch, where every arm below it is what stopped being reached.
+    #[test]
+    fn a_guard_added_above_a_dispatch_reports_the_arms_below_it() {
+        let file = "\
+fn handle(key: Key) -> Result<()> {
+    if let Some(q) = typing.clone() {
+        if is_quit(key) { return Ok(()); }
+        return Ok(());
+    }
+    match key {
+        Key::Up => scroll(-1),
+        Key::Down => scroll(1),
+    }
+    Ok(())
+}
+";
+        let (dir, h) = shadow_fixture(
+            file,
+            "    if let Some(q) = typing.clone() {\n        if is_quit(key) { return Ok(()); }\n        return Ok(());\n    }",
+        );
+        let joined = shadowed(dir.path(), &h).unwrap().join("\n");
+        assert!(joined.contains("Key::Up"), "the shadowed arms are missing: {joined}");
+        assert!(joined.contains("Key::Down"), "{joined}");
+    }
+
+    /// A new function is new surface. Reading on from one walks into whatever
+    /// declaration follows it and reports that as shadowed.
+    #[test]
+    fn a_newly_added_function_shadows_nothing() {
+        let file = "\
+fn added(x: u8) -> bool {
+    if x == 0 { return false; }
+    true
+}
+fn existing(x: u8) {
+    match x {
+        1 => a(),
+        2 => b(),
+    }
+}
+";
+        let (dir, h) = shadow_fixture(
+            file,
+            "fn added(x: u8) -> bool {\n    if x == 0 { return false; }\n    true\n}",
+        );
+        assert!(shadowed(dir.path(), &h).unwrap().is_empty());
+    }
+
+    /// Prose is not control flow. "a model can return an anchor" read as a
+    /// guard, and the paragraphs under it as dispatch, was the first thing this
+    /// reported on a real pull request.
+    #[test]
+    fn a_prose_file_is_not_scanned() {
+        let dir = tempdir::Dir::new();
+        std::fs::write(
+            dir.path().join("design.md"),
+            "# Design\n  a model can return an anchor that matches nothing\n  if it does, remap it\n  else keep it\n",
+        )
+        .unwrap();
+        let diff = "diff --git a/design.md b/design.md\n@@ -1,1 +1,2 @@\n+  a model can return an anchor that matches nothing\n";
+        let h = git::parse_diff(diff);
+        assert!(shadowed(dir.path(), &h).unwrap().is_empty());
+    }
+
+    #[test]
+    fn keywords_match_on_word_boundaries() {
+        assert!(has_word("    return Ok(());", "return"));
+        assert!(!has_word("the call returns early", "return"));
+        assert!(!has_word("let ctx = context();", "next"));
     }
 
     #[test]
@@ -355,3 +517,4 @@ fn elsewhere(x: u8) {
         assert_eq!(changed_symbols(&h).len(), 1);
     }
 }
+

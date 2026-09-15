@@ -260,7 +260,15 @@ If the generator returns no intent question, the coverage line says so rather th
 
 Its reference answer is unusually solid for a free-text question: the dispatch lines are quoted in the context, so the reference is read off them — which of these does the guard's condition now prevent reaching — rather than reasoned about. That puts it nearer `checkable` than `prediction` on how often the judge can be wrong about a correct answer.
 
-Like `cross_cutting`, it is skipped where the context is empty, and for the same reason: without the quoted dispatch the model invents a plausible shadow, and a fabricated reference plus a correct human answer is a false block. The detector is deliberately crude — a keyword scan for flow control in the added lines, then the unchanged dispatch below it to the end of its block — and requires two dispatch lines before it reports anything, since one under a guard is as likely to be that guard's own else-branch.
+Like `cross_cutting`, it is skipped where the context is empty, and for the same reason: without the quoted dispatch the model invents a plausible shadow, and a fabricated reference plus a correct human answer is a false block. The detector is deliberately crude — a keyword scan for flow control in the added lines, then the unchanged dispatch below them to the end of the block the change was inserted into — and requires two dispatch lines before it reports anything, since one under a guard is as likely to be that guard's own else-branch.
+
+Three rules do the real work, each earned by a false positive on a live PR:
+
+- **Prose and data files are skipped by extension.** "A model can return an anchor" is a sentence, not a guard, and the paragraphs under it are not dispatch. The first thing this ever reported was three paragraphs of this document.
+- **Keywords match on word boundaries**, or `returns` is a return and `context` contains a `next`.
+- **A hunk whose outermost added line opens a declaration is skipped**, and the downward scan stops at the next declaration at that level. An added function is new surface and shadows nothing; reading on from one walks out of it and reports the following function's dispatch.
+
+The level read from is the outermost line the change added, not the line that returns. A `return` sits inside the `if` that decides it, so reading from the `return` stops at its own closing brace and sees nothing — which is exactly what the first working version did on the case it was built for.
 
 **At least one `checkable` per gate, where a test command exists.** This is the structural defence against the shared blind spot in §8: a question you settle by running `bin/rails runner` or `cargo test` has a ground truth outside the model. Where `context.rs` found no runnable command, or the change has no observable behaviour (pure refactor), the generator may return none — and the gate prints `no checkable` in its coverage line. Requiring one unconditionally would only make the model invent a command, which is the exact failure being defended against.
 
