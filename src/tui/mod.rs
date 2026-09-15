@@ -105,6 +105,17 @@ pub struct App {
     /// Rows the diff pane last drew, so scrolling can be clamped to content.
     /// Only the renderer knows the height.
     pub viewport: std::cell::Cell<u16>,
+    /// The committed search, lowercased for case-insensitive matching. Empty
+    /// when there is none, which is what leaves `n`/`p` on hunks.
+    pub search: String,
+    /// The query being typed, while the `/` prompt is open. Separate from
+    /// `search`, because an abandoned prompt has to leave the old search
+    /// standing rather than wipe it.
+    pub typing: Option<String>,
+    /// Which match `n`/`p` are sitting on. Held rather than derived from the
+    /// scroll offset: matches past `max_scroll` all clamp to the same row, and
+    /// stepping from the row would land on the first of them forever.
+    match_cursor: usize,
     pub status: String,
     pub quit: bool,
 }
@@ -120,6 +131,9 @@ impl App {
             scroll: 0,
             hscroll: 0,
             viewport: std::cell::Cell::new(20),
+            search: String::new(),
+            typing: None,
+            match_cursor: 0,
             status: STATUS_ANSWERING.into(),
             quit: false,
         }
@@ -302,6 +316,68 @@ impl App {
         self.jump(forward, |d| d.is_file_header);
     }
 
+    /// Rows containing the search, in diff order.
+    fn match_rows(&self) -> Vec<usize> {
+        if self.search.is_empty() {
+            return Vec::new();
+        }
+        self.diff
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.text.to_lowercase().contains(&self.search))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn match_count(&self) -> usize {
+        self.match_rows().len()
+    }
+
+    /// Take a typed query. The first match at or after the current position is
+    /// the one to land on: searching is a way of moving on from where you are,
+    /// not of starting the diff again.
+    pub fn commit_search(&mut self, query: &str) {
+        self.search = query.to_lowercase();
+        let rows = self.match_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let here = self.scroll as usize;
+        self.match_cursor = rows.iter().position(|&i| i >= here).unwrap_or(0);
+        self.scroll = (rows[self.match_cursor] as u16).min(self.max_scroll());
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+        self.match_cursor = 0;
+    }
+
+    /// Step to the next or previous match, wrapping like a search does.
+    /// `false` means there was nothing to step to.
+    pub fn jump_match(&mut self, forward: bool) -> bool {
+        let rows = self.match_rows();
+        if rows.is_empty() {
+            return false;
+        }
+        let n = rows.len();
+        self.match_cursor = if forward {
+            (self.match_cursor + 1) % n
+        } else {
+            (self.match_cursor + n - 1) % n
+        };
+        self.scroll = (rows[self.match_cursor] as u16).min(self.max_scroll());
+        true
+    }
+
+    /// `3/12 matching retry` for the status line.
+    pub fn match_status(&self) -> String {
+        let n = self.match_count();
+        if n == 0 {
+            return format!("no match for {}", self.search);
+        }
+        format!("{}/{} matching {}", self.match_cursor + 1, n, self.search)
+    }
+
     fn jump_to_anchor(&mut self, hunks: &[git::Hunk]) {
         let Some(q) = self.questions.get(self.current) else { return };
         let Some(hunk) = hunks.iter().find(|h| h.anchor == q.anchor) else { return };
@@ -394,7 +470,7 @@ fn build_diff_view(diff: &str, ai_hunks: &[git::Hunk]) -> Vec<DiffLine> {
 }
 
 const STATUS_ANSWERING: &str =
-    "a answer · h hint · d dispute · tab/1-9 question · n/p hunk · g back · q quit";
+    "a answer · h hint · d dispute · tab/1-9 question · n/p hunk · / search · g back · q quit";
 const STATUS_ANSWERED: &str =
     "^s submit & move on · e revise · h hint · d dispute · tab/1-9 question · q quit";
 const STATUS_REVIEWING: &str =
@@ -682,6 +758,43 @@ fn event_loop(
 
         let Some(key) = input.next(app)? else { continue };
 
+        // The `/` prompt swallows the keyboard while it is open: every
+        // printable key is part of the query, not a binding.
+        if let Some(query) = app.typing.clone() {
+            // Ctrl-C is not text. A prompt that eats it leaves no way out of
+            // the quiz but killing the terminal.
+            if is_ctrl_c(&key) {
+                app.typing = None;
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Esc => {
+                    app.typing = None;
+                    app.status = status_for(app);
+                }
+                KeyCode::Enter => {
+                    app.typing = None;
+                    if query.is_empty() {
+                        app.clear_search();
+                        app.status = status_for(app);
+                    } else {
+                        app.commit_search(&query);
+                        app.status = app.match_status();
+                    }
+                }
+                KeyCode::Backspace => {
+                    let mut q = query;
+                    q.pop();
+                    app.typing = Some(q);
+                }
+                KeyCode::Char(c) => {
+                    app.typing = Some(format!("{query}{c}"));
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         match (key.code, app.mode() == Mode::Reviewing) {
             // Quitting with calls outstanding throws away answers that have
             // already been paid for, so it takes a second press.
@@ -707,8 +820,26 @@ fn event_loop(
             (KeyCode::Right, _) => app.hscroll = app.hscroll.saturating_add(8),
             (KeyCode::Left, _) => app.hscroll = app.hscroll.saturating_sub(8),
 
+            // Search, and step through what it found. With no search running
+            // `n`/`p` stay on hunks, which is what they have always done —
+            // `}`/`{` reach hunks while a search holds `n`/`p`.
+            (KeyCode::Char('/'), _) => {
+                app.typing = Some(String::new());
+            }
+            (KeyCode::Esc, _) if !app.search.is_empty() => {
+                app.clear_search();
+                app.status = status_for(app);
+            }
+            (KeyCode::Char('n'), _) | (KeyCode::Char('p'), _)
+                if !app.search.is_empty() =>
+            {
+                app.jump_match(key.code == KeyCode::Char('n'));
+                app.status = app.match_status();
+            }
             (KeyCode::Char('n'), _) => app.jump_hunk(true),
             (KeyCode::Char('p'), _) => app.jump_hunk(false),
+            (KeyCode::Char('}'), _) => app.jump_hunk(true),
+            (KeyCode::Char('{'), _) => app.jump_hunk(false),
             (KeyCode::Char(']'), _) => app.jump_file(true),
             (KeyCode::Char('['), _) => app.jump_file(false),
 
@@ -916,13 +1047,19 @@ fn goto(app: &mut App, i: usize, ai_hunks: &[git::Hunk]) {
         return;
     }
     app.current = i % app.questions.len();
-    app.status = match app.mode() {
+    app.status = status_for(app);
+    app.jump_to_anchor(ai_hunks);
+}
+
+/// The key list the current mode calls for. Anything that takes the status
+/// line over — a search, a message — puts it back through here.
+fn status_for(app: &App) -> String {
+    match app.mode() {
         Mode::Grading => format!("question {} is with the judge", app.current + 1),
         Mode::Reviewing => STATUS_REVIEWING.into(),
         Mode::Answering if app.answer().is_empty() => STATUS_ANSWERING.into(),
         Mode::Answering => STATUS_ANSWERED.into(),
-    };
-    app.jump_to_anchor(ai_hunks);
+    }
 }
 
 /// Move to the next question that still needs answering. `false` when there is
@@ -1248,6 +1385,65 @@ diff --git a/sync.rs b/sync.rs
             true,
         )
         .unwrap()
+    }
+
+    fn plain(code: KeyCode) -> event::KeyEvent {
+        event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Ctrl-C is not query text. A prompt that eats it leaves the quiz with no
+    /// way out but killing the terminal.
+    #[test]
+    fn ctrl_c_quits_from_inside_the_search_prompt() {
+        // No trailing `q`: reaching the end of the scripted keys instead of
+        // quitting is what a swallowed ctrl-c looks like.
+        let app = drive(
+            1,
+            llm::stub::StubJudge::scripted([]),
+            vec![key('/'), key('a'), ctrl('c')],
+        );
+        assert!(app.typing.is_none(), "ctrl-c was swallowed by the prompt");
+    }
+
+    /// The prompt has to own the keyboard: `retry_count` contains `e`, which
+    /// otherwise opens $EDITOR, and `n`, which otherwise jumps a hunk.
+    #[test]
+    fn the_search_prompt_swallows_keys_that_are_bindings() {
+        let mut keys = vec![key('/')];
+        keys.extend("retry_count".chars().map(key));
+        keys.push(plain(KeyCode::Enter));
+        keys.push(key('q'));
+
+        let app = drive(1, llm::stub::StubJudge::scripted([]), keys);
+        assert_eq!(app.search, "retry_count");
+        assert!(app.typing.is_none());
+        assert!(app.slots[0].answer.is_empty(), "a query key reached $EDITOR");
+        assert_eq!(app.match_count(), 1);
+    }
+
+    #[test]
+    fn backspace_edits_the_query_and_escape_abandons_it() {
+        let keys = vec![
+            key('/'), key('r'), key('x'), plain(KeyCode::Backspace),
+            key('e'), key('t'), key('r'), key('y'), plain(KeyCode::Enter),
+            key('/'), key('z'), plain(KeyCode::Esc),
+            key('q'),
+        ];
+        let app = drive(1, llm::stub::StubJudge::scripted([]), keys);
+        assert_eq!(app.search, "retry", "backspace did not edit the query");
+        assert!(app.typing.is_none());
+    }
+
+    /// With a search running `n` and `p` belong to it; `escape` hands them back.
+    #[test]
+    fn escape_clears_the_search() {
+        let keys = vec![
+            key('/'), key('r'), key('e'), key('t'), key('r'), key('y'),
+            plain(KeyCode::Enter), plain(KeyCode::Esc), key('q'),
+        ];
+        let app = drive(1, llm::stub::StubJudge::scripted([]), keys);
+        assert!(app.search.is_empty());
+        assert_eq!(app.status, STATUS_ANSWERING);
     }
 
     #[test]
@@ -1689,6 +1885,90 @@ diff --git a/b.rs b/b.rs
         for text in ["diff --git", "@@ -10,3", "--- a/a.rs", "+++ b/a.rs"] {
             assert_eq!(numbered(text), None, "{text} should have no line number");
         }
+    }
+
+    fn search_app(query: &str) -> App {
+        let mut app = app_with(3);
+        app.commit_search(query);
+        app
+    }
+
+    fn row_at_scroll(app: &App) -> &str {
+        &app.diff[app.scroll as usize].text
+    }
+
+    #[test]
+    fn a_search_lands_on_the_first_match_from_here() {
+        let app = search_app("added_line");
+        assert!(row_at_scroll(&app).contains("added_line"));
+    }
+
+    #[test]
+    fn a_search_ignores_case() {
+        assert_eq!(search_app("ADDED_LINE").match_count(), 1);
+    }
+
+    /// `n` and `p` are the whole point of the search: stepping has to reach
+    /// every match and come back round, not stall on the last one.
+    #[test]
+    fn stepping_wraps_through_every_match() {
+        let mut app = search_app("rs");
+        let n = app.match_count();
+        assert!(n >= 4, "expected several matches, got {n}");
+        let first = app.scroll;
+        for _ in 0..n {
+            assert!(app.jump_match(true));
+        }
+        assert_eq!(app.scroll, first);
+    }
+
+    #[test]
+    fn stepping_backwards_wraps_too() {
+        let mut app = search_app("rs");
+        let first = app.scroll;
+        app.jump_match(false);
+        assert_ne!(app.scroll, first);
+        app.jump_match(true);
+        assert_eq!(app.scroll, first);
+    }
+
+    /// The clamp pins every match past `max_scroll` to the same row. Stepping
+    /// reads a cursor rather than the row, or it would land on the first of
+    /// them forever.
+    #[test]
+    fn stepping_past_the_clamp_still_advances() {
+        let mut app = app_with(3);
+        app.commit_search("b.rs");
+        let clamped: Vec<usize> = (0..app.match_count())
+            .map(|_| {
+                app.jump_match(true);
+                app.match_status()
+            })
+            .map(|s| s.split('/').next().unwrap().parse().unwrap())
+            .collect();
+        let mut sorted = clamped.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), clamped.len(), "a step repeated a match");
+    }
+
+    #[test]
+    fn a_search_with_no_match_leaves_the_position_alone() {
+        let mut app = app_with(3);
+        app.scroll_by(2);
+        let before = app.scroll;
+        app.commit_search("NOTHINGMATCHESTHIS");
+        assert_eq!(app.scroll, before);
+        assert!(!app.jump_match(true));
+        assert!(app.match_status().starts_with("no match"));
+    }
+
+    #[test]
+    fn clearing_the_search_gives_n_and_p_back_to_hunks() {
+        let mut app = search_app("rs");
+        app.clear_search();
+        assert_eq!(app.match_count(), 0);
+        assert!(!app.jump_match(true));
     }
 
     #[test]

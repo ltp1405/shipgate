@@ -31,6 +31,44 @@ fn diff_line_style(line: &str, ai: bool) -> Style {
     }
 }
 
+/// Split a visible line so every occurrence of the search stands out. Jumping
+/// to a matching row is only half of finding something: on a long line the hit
+/// still has to be picked out by eye.
+fn highlighted(visible: &str, search: &str, base: Style) -> Vec<Span<'static>> {
+    let plain = vec![Span::styled(visible.to_string(), base)];
+    if search.is_empty() {
+        return plain;
+    }
+    let lower = visible.to_lowercase();
+    // Offsets found in the lowercased copy only index the original when
+    // lowercasing kept every byte in place. Where it did not — a handful of
+    // characters grow — leave the line unhighlighted rather than slice it
+    // mid-character and panic.
+    if lower.len() != visible.len() || !lower.contains(search) {
+        return plain;
+    }
+
+    let hit = base
+        .bg(Color::Yellow)
+        .fg(Color::Black)
+        .remove_modifier(Modifier::DIM);
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(off) = lower[at..].find(search) {
+        let start = at + off;
+        let end = start + search.len();
+        if start > at {
+            spans.push(Span::styled(visible[at..start].to_string(), base));
+        }
+        spans.push(Span::styled(visible[start..end].to_string(), hit));
+        at = end;
+    }
+    if at < visible.len() {
+        spans.push(Span::styled(visible[at..].to_string(), base));
+    }
+    spans
+}
+
 fn label_style(label: Label) -> Style {
     let c = match label {
         Label::Demonstrates => Color::Green,
@@ -55,8 +93,14 @@ pub fn render(f: &mut Frame, app: &App) {
     render_diff(f, app, panes[0]);
     render_question(f, app, panes[1]);
 
+    // While the prompt is open it owns the status line: the query has to be
+    // visible as it is typed, or you are searching blind.
+    let text = match &app.typing {
+        Some(q) => format!("/{q}"),
+        None => app.status.clone(),
+    };
     let status = Paragraph::new(Line::from(Span::styled(
-        format!(" {}", app.status),
+        format!(" {text}"),
         Style::default().fg(Color::Black).bg(Color::Cyan),
     )));
     f.render_widget(status, outer[1]);
@@ -100,7 +144,7 @@ fn render_diff(f: &mut Frame, app: &App, area: Rect) {
                 gutter,
                 Style::default().fg(Color::DarkGray),
             )];
-            spans.push(Span::styled(visible, diff_line_style(&d.text, d.ai)));
+            spans.extend(highlighted(&visible, &app.search, diff_line_style(&d.text, d.ai)));
             if clipped {
                 spans.push(Span::styled("›", Style::default().fg(Color::Yellow)));
             }
@@ -298,6 +342,42 @@ pub(crate) mod tests {
         let x = rows[y][..byte].chars().count() as u16;
         let c = buf.cell((x, y as u16)).unwrap();
         Style::default().fg(c.fg).bg(c.bg).add_modifier(c.modifier)
+    }
+
+    #[test]
+    fn the_prompt_shows_the_query_as_it_is_typed() {
+        let mut app = app();
+        app.typing = Some("AIAUT".into());
+        let buf = draw(&app, W, H);
+        assert!(contains(&buf, "/AIAUT"), "query not on the status line");
+        assert!(!contains(&buf, "STATUSLINE"), "prompt did not take the line");
+    }
+
+    /// Landing on the row is not finding it — the hit itself has to be marked.
+    #[test]
+    fn a_match_is_highlighted_in_the_diff() {
+        let mut app = app();
+        app.commit_search("aiauthored");
+        let buf = draw(&app, W, H);
+        assert_eq!(style_of(&buf, "AIAUTHORED").bg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn a_line_with_no_match_is_left_alone() {
+        let mut app = app();
+        app.commit_search("aiauthored");
+        let buf = draw(&app, W, H);
+        assert_ne!(style_of(&buf, "HANDTYPEDLINE").bg, Some(Color::Yellow));
+    }
+
+    /// Highlighting slices the line; the text it shows must still be the text
+    /// that was there, case included.
+    #[test]
+    fn highlighting_does_not_change_the_line() {
+        let base = Style::default();
+        let spans = highlighted("Let RetryCount = 3", "retrycount", base);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "Let RetryCount = 3");
     }
 
     #[test]
