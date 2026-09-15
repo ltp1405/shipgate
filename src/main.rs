@@ -26,7 +26,7 @@ enum Command {
     /// Every PR waiting on you, across every watched repository. This is what
     /// runs when shipgate is invoked with no arguments.
     Dash,
-    /// Quiz the AI-authored parts of this PR, then write the description and mark it ready.
+    /// Quiz the AI-authored parts of this PR. The PR itself is left alone.
     Ready {
         /// Run the quiz but touch nothing on GitHub.
         #[arg(long)]

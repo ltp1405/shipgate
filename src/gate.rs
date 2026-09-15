@@ -1,5 +1,5 @@
-//! Gate lifecycle, pass rule, coverage, and the PR description — the thing that
-//! makes `shipgate ready` worth running instead of `gh pr ready`.
+//! Gate lifecycle, pass rule, and coverage. Clearing the gate is recorded here
+//! and nowhere else: the pull request itself is left alone.
 
 use crate::{authorship, config, context, dash, db, gh, git, llm, triage, tui};
 use anyhow::{bail, Context as _, Result};
@@ -319,8 +319,7 @@ impl Ready {
         }
 
         db::set_gate_state(&conn, gate_id, "cleared")?;
-        let body = self.description(&conn, &dir, &pr, &questions, &coverage)?;
-        self.submit(&dir, &pr, &body)
+        self.report(&conn, &pr, &questions, &coverage)
     }
 
     /// The model backend, or `None` to run offline. `--offline` forces the
@@ -411,8 +410,7 @@ impl Ready {
             return Ok(());
         }
         db::set_gate_state(conn, gate.id, "cleared")?;
-        let body = self.description(conn, dir, pr, &questions, &coverage)?;
-        self.submit(dir, pr, &body)
+        self.report(conn, pr, &questions, &coverage)
     }
 
     /// Shared by the fresh and replayed paths.
@@ -543,140 +541,40 @@ impl Ready {
         Ok(())
     }
 
-    /// §10 — built from your answers, not the reference answers, and not a
-    /// summary of the diff. Returns the shipgate section alone; `merge_into`
-    /// puts it in the description without disturbing what is already there.
-    fn description(
+    /// §10 — what clearing the gate leaves behind. shipgate does not touch the
+    /// pull request: it does not write the description, does not mark the PR
+    /// ready and does not comment. The answers were for thinking with, and a
+    /// description assembled from replies to questions the reader cannot see
+    /// reads as a transcript, not as prose — the author writes that themselves.
+    ///
+    /// What is printed is what only shipgate knows: how much of the diff the
+    /// quiz covered, and any obligation an upheld dispute opened.
+    fn report(
         &self,
         conn: &Connection,
-        dir: &Path,
         pr: &gh::Pr,
         questions: &[db::Question],
         coverage: &Coverage,
-    ) -> Result<String> {
-        let answer_for = |kind: &str| -> Option<String> {
-            questions
-                .iter()
-                .find(|q| q.kind == kind)
-                .and_then(|q| db::last_answer(conn, q.id).ok().flatten())
-                .filter(|a| !a.trim().is_empty())
-        };
+    ) -> Result<()> {
+        println!("\nCleared · {coverage}");
 
-        let mut body = String::new();
-        body.push_str("## What this changes\n\n");
-        match answer_for("intent").or_else(|| answer_for("justification")) {
-            Some(a) => body.push_str(&format!("{a}\n")),
-            None => {
-                let commits = gh::pr_commits(dir, pr.number).unwrap_or_default();
-                for c in commits {
-                    body.push_str(&format!("- {c}\n"));
-                }
-            }
-        }
-
-        let behaviour: Vec<String> = ["prediction", "adversarial", "cross_cutting"]
-            .iter()
-            .filter_map(|k| answer_for(k))
-            .collect();
-        if !behaviour.is_empty() {
-            body.push_str("\n## Behaviour worth knowing\n\n");
-            for b in behaviour {
-                body.push_str(&format!("- {b}\n"));
-            }
-        }
-
-        if let Some(a) = answer_for("checkable") {
-            body.push_str(&format!("\n## Verified\n\n{a}\n"));
-        }
-
-        // §8 — an upheld code_bug is an open obligation, and the PR is the
-        // place it is owed. Quietly clearing the gate without saying so is how
-        // "the code is wrong" becomes a free skip.
+        // §8 — an upheld code_bug is an open obligation. Quietly clearing the
+        // gate without saying so is how "the code is wrong" becomes a free skip.
         let deferred: Vec<&db::Question> =
             questions.iter().filter(|q| q.status == "deferred").collect();
         if !deferred.is_empty() {
-            body.push_str("\n## Open on this change\n\n");
+            println!("\nOpen on this change:");
             for q in deferred {
                 let claim = db::last_dispute(conn, q.id)?.unwrap_or_default();
-                body.push_str(&format!("- {} — {claim}\n", q.file));
+                println!("  {} — {claim}", q.file);
             }
+            println!("\n`shipgate status` lists these again.");
         }
 
-        // The coverage line ships in the description too: anyone trusting this
-        // should see how much of the diff it covered.
-        body.push_str(&format!("\n---\n<sub>{coverage} · shipgate</sub>\n"));
-        Ok(body)
-    }
-
-    fn submit(&self, dir: &Path, pr: &gh::Pr, section: &str) -> Result<()> {
-        // What the description says now, not what it said when the gate was
-        // created. The quiz takes minutes, and a description written in the
-        // meantime — by you, by a template, by a bot — is not ours to throw
-        // away. A failed read is treated as an empty description rather than
-        // blocking the submission, and the editor shows the result either way.
-        let existing = gh::pr_body(dir, pr.number).unwrap_or_else(|e| {
-            eprintln!("warning: could not read the current description ({e}) — writing ours alone");
-            String::new()
-        });
-        let body = merge_into(&existing, section);
-
-        let path = std::env::temp_dir().join(format!("shipgate-pr-{}.md", pr.number));
-        std::fs::write(&path, &body)?;
-
-        // Never posted unread.
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-        if self.dry_run {
-            println!("[dry-run] description written to {}", path.display());
-            println!("\n{body}");
-            println!("[dry-run] would run: gh pr edit {} --body-file …", pr.number);
-            println!("[dry-run] would run: gh pr ready {}", pr.number);
-            return Ok(());
-        }
-
-        let status = std::process::Command::new(&editor).arg(&path).status()?;
-        if !status.success() {
-            bail!("{editor} exited non-zero; nothing submitted");
-        }
-
-        gh::pr_set_body(dir, pr.number, &path)?;
-        if pr.is_draft {
-            gh::pr_ready(dir, pr.number)?;
-        }
-        println!("#{} ready · {}", pr.number, pr.url);
+        println!("\n#{} is yours to mark ready · {}", pr.number, pr.url);
         Ok(())
     }
 }
-
-/// §10 — put the shipgate section into a description that may already say
-/// something, and put it in the same place every time.
-///
-/// Between the markers is ours and is replaced; everything else is the author's
-/// and is kept byte for byte. Without the markers a second run appends a second
-/// copy, and the description grows a section per re-quiz.
-fn merge_into(existing: &str, section: &str) -> String {
-    let block = format!("{BEGIN}\n{}\n{END}", section.trim_end());
-    let trimmed = existing.trim();
-
-    if let Some(start) = existing.find(BEGIN) {
-        // An end marker before the start marker, or none at all, means the
-        // description has been edited into a shape we cannot reason about.
-        // Appending is wrong but recoverable; guessing at the boundary and
-        // cutting the author's text is not.
-        if let Some(rel) = existing[start..].find(END) {
-            let end = start + rel + END.len();
-            return format!("{}{block}{}", &existing[..start], &existing[end..]);
-        }
-    }
-    if trimmed.is_empty() {
-        return block;
-    }
-    format!("{trimmed}\n\n{block}")
-}
-
-/// Markers, not a heading: a heading is something the author might reasonably
-/// write themselves, and mistaking theirs for ours would delete it.
-const BEGIN: &str = "<!-- shipgate:begin -->";
-const END: &str = "<!-- shipgate:end -->";
 
 /// The dashboard. Unlike every other entry point this has no working directory
 /// to infer from, so each row carries the path it belongs to and the quiz runs
@@ -806,56 +704,6 @@ mod tests {
     #[test]
     fn the_dropped_one_still_has_a_floor() {
         assert!(!passes(&[0.9, 0.9, 0.0]));
-    }
-
-    /// The description is the author's, not ours. A PR that already says
-    /// something — a template, a screenshot, a note to the reviewer — keeps it.
-    #[test]
-    fn an_existing_description_is_kept() {
-        let out = super::merge_into("Fixes #42.\n\n![screenshot](x.png)", "## What this changes\n\nthings");
-        assert!(out.starts_with("Fixes #42.\n\n![screenshot](x.png)"), "{out}");
-        assert!(out.contains("## What this changes"));
-    }
-
-    /// Re-running must replace our section, not stack another copy under it.
-    #[test]
-    fn a_second_run_replaces_only_our_own_section() {
-        let first = super::merge_into("Author's notes.", "first section");
-        let second = super::merge_into(&first, "second section");
-        assert!(second.contains("Author's notes."));
-        assert!(second.contains("second section"));
-        assert!(!second.contains("first section"), "the old section was left behind");
-        assert_eq!(second.matches(super::BEGIN).count(), 1, "markers accumulated");
-    }
-
-    /// Text the author added after our section is theirs too, and survives a
-    /// re-run that rewrites the middle.
-    #[test]
-    fn text_on_both_sides_of_the_section_survives() {
-        let first = super::merge_into("above", "ours");
-        let edited = format!("{first}\n\nbelow");
-        let second = super::merge_into(&edited, "ours again");
-        assert!(second.starts_with("above"), "{second}");
-        assert!(second.trim_end().ends_with("below"), "{second}");
-        assert!(second.contains("ours again"));
-    }
-
-    #[test]
-    fn an_empty_description_gets_the_section_alone() {
-        let out = super::merge_into("   \n", "ours");
-        assert!(out.starts_with(super::BEGIN));
-        assert!(out.trim_end().ends_with(super::END));
-    }
-
-    /// A half-deleted marker pair leaves no boundary we can trust. Appending a
-    /// duplicate is untidy; guessing where our section ended would cut the
-    /// author's text.
-    #[test]
-    fn a_broken_marker_pair_appends_rather_than_guessing() {
-        let mangled = format!("{} stray text with no end", super::BEGIN);
-        let out = super::merge_into(&mangled, "ours");
-        assert!(out.contains("stray text with no end"), "author text was cut: {out}");
-        assert!(out.contains("ours"));
     }
 
     /// An empty score list is a pass — no questions, nothing failed — which is

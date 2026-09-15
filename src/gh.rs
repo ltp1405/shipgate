@@ -64,34 +64,8 @@ pub fn pr_ready(dir: &Path, number: u64) -> Result<()> {
     Ok(())
 }
 
-/// The PR's description as it stands right now. Read at submission time rather
-/// than when the gate was created: a quiz takes minutes, and whatever was
-/// written in the meantime is not ours to discard.
-pub fn pr_body(dir: &Path, number: u64) -> Result<String> {
-    #[derive(Deserialize)]
-    struct B {
-        body: String,
-    }
-    let out = gh(dir, &["pr", "view", &number.to_string(), "--json", "body"])?;
-    Ok(serde_json::from_str::<B>(&out)?.body)
-}
-
-pub fn pr_set_body(dir: &Path, number: u64, body_file: &Path) -> Result<()> {
-    gh(
-        dir,
-        &[
-            "pr",
-            "edit",
-            &number.to_string(),
-            "--body-file",
-            &body_file.to_string_lossy(),
-        ],
-    )?;
-    Ok(())
-}
-
-/// Commit subjects on the PR, used as the description fallback when there is
-/// no justification answer to build "What this changes" from.
+/// Commit subjects on the PR. Feed the question generator what the change says
+/// about itself, so an answer that only restates it can be caught.
 pub fn pr_commits(dir: &Path, number: u64) -> Result<Vec<String>> {
     #[derive(Deserialize)]
     struct C {

@@ -1,6 +1,6 @@
 # shipgate — design sketch (v2)
 
-A voluntary quiz you run before marking a pull request ready for review. It generates hard questions from the AI-authored parts of the PR diff, grades your answers, and turns them into the PR description. Solo tool. Rust, Ratatui, SQLite, `gh`.
+A voluntary quiz you run before marking a pull request ready for review. It generates hard questions from the AI-authored parts of the PR diff, and grades your answers. It does not touch the pull request. Solo tool. Rust, Ratatui, SQLite, `gh`.
 
 > v1 gated `git push` via a pre-push hook and a Claude Code Stop hook. That placement fired at maximum impatience and minimum recall, on an incoherent batch, and was bypassed by `--no-verify` at no cost. It is kept at `shipgate-design.v1-pushgate.md`. This version moves the gate to the draft→ready transition and drops enforcement in favour of convenience.
 
@@ -8,14 +8,14 @@ A voluntary quiz you run before marking a pull request ready for review. It gene
 
 Enforcement is fiction in a solo tool — you hold the override key. So the gate is not a lock. It is the most convenient way to open a PR, and it happens to require you to understand the diff first.
 
-`shipgate ready` must do strictly *more* than `gh pr ready`: it flips the PR to ready **and writes the description**. Skipping it costs you work rather than saving you work. That is the entire enforcement mechanism, and it is sturdier than a hook with a `--no-verify` escape.
+`shipgate ready` does not flip the PR and does not write the description — it is voluntary, and nothing is enforced. What it buys is the questions themselves: the parts of your own diff you cannot explain are cheaper to find here than in review.
 
 Four consequences that shape everything below:
 
 - **Only the AI's code.** Being quizzed on lines you typed yourself is noise, and noise is what teaches you to reach for the override. Scope to hunks from commits carrying a `Co-Authored-By: Claude …` trailer.
 - **Open book.** The diff is days old by the time a PR is ready. Questions test reasoning about code you can see, not recall of code you wrote.
 - **Honest about coverage.** Three questions on a 200-line diff is a real gate. Three on a 2000-line diff is theatre. The tool says which one you just passed.
-- **The answers are the product.** They become the PR description. A quiz whose output is discarded is a toll.
+- **The answers are the product.** What they buy is the understanding, not a document. The questions you cannot answer are the output worth having.
 
 ## 1. Crate layout
 
@@ -32,7 +32,7 @@ shipgate/
 │   ├── authorship.rs      # Co-Authored-By trailers → set of AI-authored hunks
 │   ├── triage.rs          # does this diff deserve a quiz at all
 │   ├── context.rs         # call sites + test command, gathered from the repo
-│   ├── gate.rs            # lifecycle, pass rule, coverage, PR description assembly
+│   ├── gate.rs            # lifecycle, pass rule, coverage
 │   ├── stats.rs           # pass rate by question kind over time
 │   ├── llm/
 │   │   ├── mod.rs         # Anthropic Messages client (reqwest blocking, on a thread)
@@ -41,7 +41,6 @@ shipgate/
 │   └── tui/
 │       ├── mod.rs         # app loop, mpsc event bus
 │       ├── quiz.rs        # split pane: diff | question + answer
-│       └── summary.rs     # assembled PR description, editable before submit
 ```
 
 Crates: `clap`, `ratatui`, `crossterm`, `rusqlite` (feature `bundled`), `serde`, `serde_json`, `reqwest` (blocking + json), `anyhow`, `chrono`, `directories`.
@@ -330,35 +329,26 @@ Review feedback arrives, you push more commits, sometimes after a rebase.
 - A question whose anchor is gone goes back to `open`; new AI-authored hunks get new questions.
 - **If the PR's `base_sha` changed** — rebase onto a moved `develop`, or a retargeted PR — do not attempt to match. Regenerate the gate. Pretending the old anchors mean anything across a base change produces confident nonsense.
 
-## 10. Output: the PR description
+## 10. Output: what clearing leaves behind
 
-The reason to run this instead of `gh pr ready`.
+**shipgate does not touch the pull request.** It does not write the description, does not mark the PR ready, does not comment. `shipgate ready` clears the gate; flipping the PR is yours.
 
-On clear, assemble a description from **your** answers — not the reference answers, not a summary of the diff:
+Earlier versions assembled a description from your answers, between `<!-- shipgate:begin -->` and `<!-- shipgate:end -->`. That is gone. The answers are replies to questions the reader never sees, so they shipped as a transcript — "No, the validation ran in the transaction…" under a heading, answering nothing on the page — sitting next to the description the author had already written. A quiz that produces good thinking does not thereby produce good prose, and pasting one into the other made both worse.
 
-```markdown
-## What this changes
-<from the intent answer — falling back to justification, then gh's commit list>
+On clear, print to the terminal what only shipgate knows:
 
-## Behaviour worth knowing
-<the prediction and adversarial answers, lightly edited>
+```
+Cleared · 5 questions · 6/31 AI hunks · trailers
 
-## Verified
-<the checkable answer, with the command actually run>
+Open on this change:
+  app/models/picqer_integration.rb — the validation runs before anything persists
 
----
-<sub>5 questions · 6/31 AI hunks · shipgate</sub>
+#412 is yours to mark ready · https://github.com/o/r/pull/412
 ```
 
-The coverage line ships in the description too. If a reviewer — or future you — is going to trust this, they should see how much of the diff it covered.
+The coverage line is printed rather than published: it describes the quiz, not the change, and a reviewer who wants it can ask `shipgate status`.
 
-One LLM call turns raw answers into prose. The assembled text opens in `$EDITOR` before submission, never posted unread. Then `gh pr edit --body-file` and `gh pr ready`.
-
-**It does not overwrite the description.** What shipgate writes lives between `<!-- shipgate:begin -->` and `<!-- shipgate:end -->`; everything outside is the author's and is kept byte for byte, so a template, a linked issue, a screenshot or a note to the reviewer survives clearing the gate. A re-quiz replaces the section rather than appending a second copy.
-
-The current description is read at submission time, not when the gate was created — a quiz takes minutes and anything written in between is not ours to discard. Markers rather than a heading, because a heading is something an author might write themselves and mistaking theirs for ours would delete it; and if the pair has been half-deleted, the section is appended rather than guessing at a boundary and cutting text.
-
-Upheld `code_bug` findings go to `~/.local/share/shipgate/notes/<repo>-<pr>.md` and are listed under **Known issues**.
+Upheld `code_bug` findings stay an open obligation in the database and are listed by `status`. Nothing about them is written to the PR — §8's teeth are that `status` keeps naming them, not that a reviewer sees them.
 
 ## 11. `status` and `stats`
 
