@@ -109,25 +109,102 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE gates ADD COLUMN path TEXT NOT NULL DEFAULT '';
     "#,
+    // 3 — a superseded gate is archived, not deleted, so the answers you were
+    // graded on survive the regeneration that replaces the questions. That
+    // means more than one row per PR, so the table's UNIQUE(repo, pr_number)
+    // has to go; SQLite cannot drop a table constraint, hence the rebuild. A
+    // partial unique index keeps the invariant that matters — one *live* gate
+    // per PR — without constraining the archive.
+    r#"
+    CREATE TABLE gates_new (
+      id              INTEGER PRIMARY KEY,
+      repo            TEXT NOT NULL,
+      pr_number       INTEGER NOT NULL,
+      branch          TEXT NOT NULL,
+      base_ref        TEXT NOT NULL,
+      base_sha        TEXT NOT NULL,
+      head_sha        TEXT NOT NULL,
+      diff            TEXT NOT NULL,
+      hunks_total     INTEGER NOT NULL,
+      hunks_ai        INTEGER NOT NULL,
+      hunks_covered   INTEGER NOT NULL,
+      authorship      TEXT NOT NULL,
+      has_checkable   INTEGER NOT NULL DEFAULT 0,
+      state           TEXT NOT NULL,
+      last_error      TEXT,
+      created_at      TEXT NOT NULL,
+      updated_at      TEXT NOT NULL,
+      cleared_at      TEXT,
+      path            TEXT NOT NULL DEFAULT '',
+      superseded_at   TEXT
+    );
+
+    INSERT INTO gates_new
+      (id, repo, pr_number, branch, base_ref, base_sha, head_sha, diff,
+       hunks_total, hunks_ai, hunks_covered, authorship, has_checkable, state,
+       last_error, created_at, updated_at, cleared_at, path, superseded_at)
+    SELECT
+       id, repo, pr_number, branch, base_ref, base_sha, head_sha, diff,
+       hunks_total, hunks_ai, hunks_covered, authorship, has_checkable, state,
+       last_error, created_at, updated_at, cleared_at, path, NULL
+    FROM gates;
+
+    DROP TABLE gates;
+    ALTER TABLE gates_new RENAME TO gates;
+
+    CREATE INDEX idx_gates_state ON gates(state);
+    CREATE UNIQUE INDEX idx_gates_live
+      ON gates(repo, pr_number) WHERE superseded_at IS NULL;
+    CREATE INDEX idx_gates_pr ON gates(repo, pr_number);
+    "#,
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let version = (i + 1) as i64;
-        if version > current {
-            conn.execute_batch("BEGIN IMMEDIATE;")?;
-            match conn.execute_batch(sql) {
-                Ok(()) => {
-                    conn.execute_batch(&format!("PRAGMA user_version = {version};"))?;
-                    conn.execute_batch("COMMIT;")?;
-                }
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK;");
-                    return Err(e).context(format!("migration {version} failed"));
-                }
+        if version <= current {
+            continue;
+        }
+        // Foreign keys off for the duration, and off *outside* the transaction
+        // — the pragma is a no-op inside one. A migration that rebuilds a
+        // parent table drops it while children still reference it, and with
+        // enforcement on, ON DELETE CASCADE would take every question and
+        // attempt in the database with it. Off, the children keep their ids
+        // and the rename puts the parent back underneath them.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let res = conn
+            .execute_batch(sql)
+            .and_then(|()| conn.execute_batch(&format!("PRAGMA user_version = {version};")));
+        let res = match res {
+            // Enforcement is off, so nothing checked the rows this migration
+            // just moved. Check them before committing rather than finding out
+            // at the next join.
+            Ok(()) => orphan_check(conn),
+            Err(e) => Err(e.into()),
+        };
+        match res {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                return Err(e).context(format!("migration {version} failed"));
             }
         }
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    }
+    Ok(())
+}
+
+/// `PRAGMA foreign_key_check` as a hard error. Reports the first offending
+/// table, which is enough to name the migration that broke it.
+fn orphan_check(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+        let table: String = row.get(0)?;
+        anyhow::bail!("left orphaned rows in {table}");
     }
     Ok(())
 }
@@ -141,9 +218,10 @@ pub struct Gate {
     /// Working tree this gate was created in. The dashboard runs git and gh
     /// there; without it a gate is unreachable from outside its own repo.
     pub path: String,
-    /// The diff snapshot taken when the gate was created. `--reuse` replays
-    /// from this rather than re-deriving it, so the questions still line up
-    /// with the text they were written against.
+    /// The diff snapshot taken when the gate was created. A replay works from
+    /// this rather than re-deriving it, so the questions still line up with the
+    /// text they were written against. Empty on an archived gate, which is
+    /// never replayed.
     pub diff: String,
     pub pr_number: u64,
     pub branch: String,
@@ -192,15 +270,14 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// One gate per PR. A re-run replaces the previous one outright — §9 regenerates
-/// rather than pretending old anchors survive a base change.
+/// One *live* gate per PR. A re-run archives the previous one — §9 regenerates
+/// rather than pretending old anchors survive a base change, but the answers
+/// you were graded on under the old questions are work you already paid for,
+/// and deleting them makes "am I getting better at this" unanswerable.
 pub fn upsert_gate(conn: &Connection, g: &NewGate) -> Result<i64> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let res = (|| -> Result<i64> {
-        conn.execute(
-            "DELETE FROM gates WHERE repo = ?1 AND pr_number = ?2",
-            params![g.repo, g.pr_number as i64],
-        )?;
+        archive_live_gate(conn, g.repo, g.pr_number)?;
         conn.execute(
             "INSERT INTO gates
                (repo, path, pr_number, branch, base_ref, base_sha, head_sha, diff,
@@ -399,20 +476,40 @@ fn gate_from_row(row: &rusqlite::Row) -> rusqlite::Result<Gate> {
     })
 }
 
+/// The live gate for a PR. Archived ones are history, never replayed and never
+/// quizzed.
 pub fn gate_for_pr(conn: &Connection, repo: &str, pr: u64) -> Result<Option<Gate>> {
-    let mut stmt = conn.prepare("SELECT * FROM gates WHERE repo = ?1 AND pr_number = ?2")?;
+    let mut stmt = conn.prepare(
+        "SELECT * FROM gates
+         WHERE repo = ?1 AND pr_number = ?2 AND superseded_at IS NULL",
+    )?;
     let mut rows = stmt.query_map(params![repo, pr as i64], gate_from_row)?;
     Ok(rows.next().transpose()?)
 }
 
 pub fn gates_for_repo(conn: &Connection, repo: &str) -> Result<Vec<Gate>> {
-    let mut stmt = conn.prepare("SELECT * FROM gates WHERE repo = ?1 ORDER BY pr_number DESC")?;
+    let mut stmt = conn.prepare(
+        "SELECT * FROM gates WHERE repo = ?1 AND superseded_at IS NULL
+         ORDER BY pr_number DESC",
+    )?;
     let rows = stmt.query_map(params![repo], gate_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// How much graded work a gate is holding. Regenerating destroys it, since
-/// questions cascade from the gate and attempts from the questions.
+/// Archive the live gate for a PR, if there is one. The diff snapshot goes:
+/// it exists only so a gate can be replayed, an archived gate never is, and it
+/// is far the largest column — keeping every diff of every regeneration is how
+/// an archive turns into a reason to delete the archive.
+fn archive_live_gate(conn: &Connection, repo: &str, pr: u64) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE gates SET superseded_at = ?1, updated_at = ?1, diff = ''
+         WHERE repo = ?2 AND pr_number = ?3 AND superseded_at IS NULL",
+        params![now(), repo, pr as i64],
+    )?)
+}
+
+/// How much graded work a gate is holding. Regenerating archives it rather than
+/// deleting it, so this is what you stop being asked about, not what is lost.
 pub fn attempt_count(conn: &Connection, gate_id: i64) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT count(*) FROM attempts a
@@ -423,21 +520,28 @@ pub fn attempt_count(conn: &Connection, gate_id: i64) -> Result<i64> {
     )?)
 }
 
-/// Every gate, newest first, for the dashboard.
+/// Every live gate, newest first, for the dashboard.
 pub fn all_gates(conn: &Connection) -> Result<Vec<Gate>> {
-    let mut stmt = conn.prepare("SELECT * FROM gates ORDER BY updated_at DESC")?;
+    let mut stmt = conn.prepare(
+        "SELECT * FROM gates WHERE superseded_at IS NULL ORDER BY updated_at DESC",
+    )?;
     let rows = stmt.query_map([], gate_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Drop gates whose PR is no longer open. Without this the dashboard only ever
-/// grows, which is what turned v1's debt tab into a list nobody opened.
+/// Take gates whose PR is no longer open off the dashboard. Without this it
+/// only ever grows, which is what turned v1's debt tab into a list nobody
+/// opened.
+///
+/// Archived, not deleted. A merged PR is where most of the answering happened,
+/// so deleting those gates would throw away the bulk of the record on the day
+/// it became history.
 pub fn prune_closed(conn: &Connection, repo: &str, open_prs: &[u64]) -> Result<usize> {
     let gates = gates_for_repo(conn, repo)?;
     let mut removed = 0;
     for g in gates {
         if !open_prs.contains(&g.pr_number) {
-            conn.execute("DELETE FROM gates WHERE id = ?1", params![g.id])?;
+            archive_live_gate(conn, repo, g.pr_number)?;
             removed += 1;
         }
     }
@@ -530,22 +634,51 @@ mod tests {
     }
 
     #[test]
-    fn re_running_replaces_the_gate_rather_than_duplicating_it() {
+    fn re_running_leaves_one_live_gate_per_pr() {
         let t = temp_db("upsert");
         let conn = open_at(&t.0).unwrap();
-        // The rowid is reused after the delete — harmless, because every table
-        // referencing a gate cascades with it.
         seed(&conn);
         seed(&conn);
-        let n: i64 = conn
+        let live: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM gates WHERE repo='o/r' AND superseded_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1, "one live gate per PR");
+        let all: i64 = conn
             .query_row("SELECT count(*) FROM gates WHERE repo='o/r'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1, "one gate per PR");
+        assert_eq!(all, 2, "the replaced gate should be kept, not deleted");
     }
 
+    /// A second live gate for the same PR is what the partial unique index
+    /// exists to refuse — the archive is allowed to hold many, the dashboard
+    /// and the replay path assume one.
     #[test]
-    fn questions_cascade_when_their_gate_is_replaced() {
-        let t = temp_db("cascade");
+    fn two_live_gates_for_one_pr_are_refused() {
+        let t = temp_db("live-unique");
+        let conn = open_at(&t.0).unwrap();
+        seed(&conn);
+        let direct = conn.execute(
+            "INSERT INTO gates
+               (repo, path, pr_number, branch, base_ref, base_sha, head_sha, diff,
+                hunks_total, hunks_ai, hunks_covered, authorship, state,
+                created_at, updated_at)
+             VALUES ('o/r','/tmp/o-r',7,'b','origin/main','a','b','d',1,1,0,'trailers','open',
+                     '2026-01-01','2026-01-01')",
+            [],
+        );
+        assert!(direct.is_err(), "a second live gate for PR 7 was accepted");
+    }
+
+    /// The answers are the expensive half of a run and the whole of the record.
+    /// Regenerating replaces the questions; it must not delete what you were
+    /// already graded on.
+    #[test]
+    fn answered_questions_survive_the_gate_being_replaced() {
+        let t = temp_db("archive");
         let conn = open_at(&t.0).unwrap();
         let gate = seed(&conn);
         insert_questions(
@@ -561,13 +694,110 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(questions_for(&conn, gate).unwrap().len(), 1);
-
-        seed(&conn); // replaces the gate
-        let orphans: i64 = conn
-            .query_row("SELECT count(*) FROM questions", [], |r| r.get(0))
+        let q = questions_for(&conn, gate).unwrap().remove(0);
+        record_attempt(&conn, q.id, "answer", "my answer", 0, "demonstrates", 0.9, "ok", "haiku")
             .unwrap();
-        assert_eq!(orphans, 0, "ON DELETE CASCADE must clear the old questions");
+
+        let fresh = seed(&conn);
+        assert_ne!(fresh, gate, "the replacement should be a new gate row");
+
+        // The new gate starts empty; the old one keeps its question and answer.
+        assert!(questions_for(&conn, fresh).unwrap().is_empty());
+        assert_eq!(questions_for(&conn, gate).unwrap().len(), 1);
+        assert_eq!(attempt_count(&conn, gate).unwrap(), 1);
+        assert_eq!(
+            last_answer(&conn, q.id).unwrap().as_deref(),
+            Some("my answer")
+        );
+    }
+
+    /// The diff is by far the largest column and exists only so a gate can be
+    /// replayed. Keeping one per regeneration is how an archive becomes a
+    /// reason to delete the archive.
+    #[test]
+    fn an_archived_gate_drops_its_diff_snapshot() {
+        let t = temp_db("archive-diff");
+        let conn = open_at(&t.0).unwrap();
+        let gate = seed(&conn);
+        seed(&conn);
+        let (diff, superseded): (String, Option<String>) = conn
+            .query_row(
+                "SELECT diff, superseded_at FROM gates WHERE id = ?1",
+                params![gate],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(diff, "");
+        assert!(superseded.is_some(), "the replaced gate was not marked");
+    }
+
+    /// A merged PR is where most of the answering happened. Taking it off the
+    /// dashboard must not take it out of the record.
+    #[test]
+    fn pruning_a_closed_pr_archives_it_rather_than_deleting_it() {
+        let t = temp_db("prune");
+        let conn = open_at(&t.0).unwrap();
+        let gate = seed(&conn);
+        assert_eq!(prune_closed(&conn, "o/r", &[]).unwrap(), 1);
+        assert!(gate_for_pr(&conn, "o/r", 7).unwrap().is_none(), "still on the dashboard");
+        assert!(all_gates(&conn).unwrap().is_empty());
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM gates WHERE id = ?1", params![gate], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "the closed PR's gate was deleted");
+    }
+
+    /// Migration 3 rebuilds the gates table, which drops it while questions and
+    /// attempts still point at it. With foreign keys enforced that cascade
+    /// would empty the database; the migration runs with them off for exactly
+    /// this reason, and this is the test that would catch it coming back.
+    #[test]
+    fn rebuilding_the_gates_table_keeps_the_rows_hanging_off_it() {
+        let t = temp_db("migrate-3");
+        let conn = Connection::open(&t.0).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Stop at version 2, the schema before the archive existed.
+        for (i, sql) in MIGRATIONS.iter().take(2).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = {};", i + 1)).unwrap();
+        }
+        // Written the way version 2 wrote it: `upsert_gate` knows about the
+        // archive column, and that column is what this migration adds.
+        conn.execute(
+            "INSERT INTO gates
+               (repo, path, pr_number, branch, base_ref, base_sha, head_sha, diff,
+                hunks_total, hunks_ai, hunks_covered, authorship, state,
+                created_at, updated_at)
+             VALUES ('o/r','/tmp/o-r',7,'b','origin/main','a','b','d',1,1,0,'trailers','open',
+                     '2026-01-01','2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let gate = conn.last_insert_rowid();
+        insert_questions(
+            &conn,
+            gate,
+            &[NewQuestion {
+                kind: "prediction",
+                file: "a.rs",
+                anchor: "sha256:x",
+                text: "q",
+                reference: "r",
+                hints: &[],
+            }],
+        )
+        .unwrap();
+        let q = questions_for(&conn, gate).unwrap().remove(0);
+        record_attempt(&conn, q.id, "answer", "kept", 0, "partial", 0.6, "f", "haiku").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+        assert_eq!(questions_for(&conn, gate).unwrap().len(), 1, "questions were cascaded away");
+        assert_eq!(attempt_count(&conn, gate).unwrap(), 1, "attempts were cascaded away");
+        assert!(gate_for_pr(&conn, "o/r", 7).unwrap().is_some(), "the gate itself was lost");
     }
 
     #[test]

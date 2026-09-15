@@ -120,15 +120,16 @@ impl Ready {
             }
         }
 
-        // Generating replaces the stored gate outright: questions cascade from
-        // the gate and attempts from the questions, so every graded answer goes
-        // with it. Say how much is being thrown away rather than doing it
-        // quietly — asking for it is what --force means.
+        // Generating replaces the stored gate: the old questions stop being
+        // asked, and the answers under them are archived rather than deleted.
+        // Say what is being set aside — it is work already paid for, even when
+        // it is no longer work you are on the hook for.
         if let Some(gate) = &stored {
             let answered = db::attempt_count(&conn, gate.id)?;
             if answered > 0 {
                 eprintln!(
-                    "warning: discarding {answered} graded answer{} on {repo}#{}",
+                    "note: archiving {answered} graded answer{} on {repo}#{} — \
+                     the new questions start unanswered",
                     if answered == 1 { "" } else { "s" },
                     pr.number
                 );

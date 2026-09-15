@@ -63,6 +63,14 @@ Multi-row writes go in `BEGIN IMMEDIATE`, never `BEGIN DEFERRED` — a deferred 
 
 Schema version lives in `PRAGMA user_version`, with ordered migration functions in `db.rs` from the first commit.
 
+**A regeneration archives the gate it replaces.** `superseded_at` is set, the diff snapshot is cleared, and the questions and attempts hanging off it stay where they are; a partial unique index keeps the invariant that matters — one *live* gate per PR — while the archive holds as many as the PR accumulated. Everything the dashboard, the replay and the status command read is filtered to live gates, so the archive is invisible until something asks for history.
+
+Deleting them instead was the earlier behaviour, and it made the record useless in the one direction it is worth having: the answers are the expensive half of a run, and the question "am I getting better at this" can only be asked over the ones a regeneration replaced. Closing a PR archives its gate for the same reason — a merged PR is where most of the answering happened.
+
+The archive drops the diff because that column is far the largest and exists only so a gate can be replayed; an archived gate never is. Keeping one diff per regeneration is how an archive becomes a reason to delete the archive.
+
+**Rebuilding a parent table needs foreign keys off.** SQLite cannot drop a table constraint, so removing `UNIQUE(repo, pr_number)` meant rebuilding `gates` — which drops it while questions and attempts still reference it. With enforcement on, `ON DELETE CASCADE` empties the database. The pragma is also a no-op inside a transaction, so it is toggled around the transaction, and `PRAGMA foreign_key_check` runs before the commit rather than trusting that it worked.
+
 ```sql
 CREATE TABLE gates (
   id              INTEGER PRIMARY KEY,
@@ -83,8 +91,12 @@ CREATE TABLE gates (
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
   cleared_at      TEXT,
-  UNIQUE(repo, pr_number)
+  path            TEXT NOT NULL DEFAULT '',
+  superseded_at   TEXT                    -- set when a regeneration replaces it
 );
+
+CREATE UNIQUE INDEX idx_gates_live
+  ON gates(repo, pr_number) WHERE superseded_at IS NULL;
 
 CREATE TABLE questions (
   id          INTEGER PRIMARY KEY,
