@@ -37,7 +37,7 @@ pub enum AppEvent {
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mode {
     /// Typing an answer.
     Answering,
@@ -58,13 +58,30 @@ pub struct DiffLine {
     pub is_file_header: bool,
 }
 
+/// What has been sent to the judge and not yet come back. Held per question,
+/// with the answer as it was submitted: you move on and revise while the call
+/// is in flight, and the verdict must be recorded against the text that was
+/// actually graded.
+#[derive(Clone)]
+pub struct Pending {
+    pub answer: String,
+    pub hints_used: usize,
+}
+
+/// Per-question state. Answering is no longer one question at a time, so none
+/// of this can live on the app as a single value.
+#[derive(Clone, Default)]
+pub struct Slot {
+    pub answer: String,
+    pub hints_shown: usize,
+    pub verdict: Option<(llm::Label, String)>,
+    pub pending: Option<Pending>,
+}
+
 pub struct App {
     pub questions: Vec<db::Question>,
     pub current: usize,
-    pub answer: String,
-    pub mode: Mode,
-    pub hints_shown: usize,
-    pub verdict: Option<(llm::Label, String)>,
+    pub slots: Vec<Slot>,
     pub scores: Vec<f64>,
     pub diff: Vec<DiffLine>,
     pub scroll: u16,
@@ -79,8 +96,92 @@ pub struct App {
 }
 
 impl App {
+    pub fn new(questions: Vec<db::Question>, diff: Vec<DiffLine>) -> Self {
+        App {
+            current: App::first_unanswered(&questions),
+            scores: App::restored_scores(&questions),
+            slots: vec![Slot::default(); questions.len()],
+            questions,
+            diff,
+            scroll: 0,
+            hscroll: 0,
+            viewport: std::cell::Cell::new(20),
+            status: STATUS_ANSWERING.into(),
+            quit: false,
+        }
+    }
+
     pub fn question(&self) -> Option<&db::Question> {
         self.questions.get(self.current)
+    }
+
+    fn slot(&self) -> &Slot {
+        static EMPTY: std::sync::OnceLock<Slot> = std::sync::OnceLock::new();
+        self.slots
+            .get(self.current)
+            .unwrap_or_else(|| EMPTY.get_or_init(Slot::default))
+    }
+
+    fn slot_mut(&mut self) -> Option<&mut Slot> {
+        let i = self.current;
+        self.slots.get_mut(i)
+    }
+
+    pub fn answer(&self) -> &str {
+        &self.slot().answer
+    }
+
+    pub fn hints_shown(&self) -> usize {
+        self.slot().hints_shown
+    }
+
+    pub fn verdict(&self) -> Option<&(llm::Label, String)> {
+        self.slot().verdict.as_ref()
+    }
+
+    /// The mode is a view of the current question's slot, not a state machine
+    /// of its own: with several questions in flight at once there is no single
+    /// thing the app is doing.
+    pub fn mode(&self) -> Mode {
+        let slot = self.slot();
+        if slot.pending.is_some() {
+            Mode::Grading
+        } else if slot.verdict.is_some() {
+            Mode::Reviewing
+        } else {
+            Mode::Answering
+        }
+    }
+
+    /// Judge calls still out. The quiz cannot end while any of these are
+    /// outstanding — the score is not known and the attempt is not recorded.
+    pub fn in_flight(&self) -> usize {
+        self.slots.iter().filter(|s| s.pending.is_some()).count()
+    }
+
+    /// One marker per question, for the pane footer: what is done, what is
+    /// being graded, and what is still waiting on you.
+    pub fn progress(&self) -> String {
+        self.slots
+            .iter()
+            .zip(&self.questions)
+            .enumerate()
+            .map(|(i, (slot, q))| {
+                let mark = if slot.pending.is_some() {
+                    '~'
+                } else if q.status == "passed" {
+                    '+'
+                } else if slot.verdict.is_some() {
+                    'x'
+                } else if !slot.answer.is_empty() {
+                    '*'
+                } else {
+                    '.'
+                };
+                format!("{}{}", i + 1, mark)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Index of the first question still worth answering, so quitting and
@@ -98,15 +199,21 @@ impl App {
         questions.iter().map(|q| q.score.unwrap_or(0.0)).collect()
     }
 
-    /// The next question that still needs an answer. `None` when the quiz is
-    /// done.
+    /// The next question that still needs you: not passed, and not already
+    /// sitting with the judge. Searches past the current question first, then
+    /// wraps, since submitting out of order is now normal.
     fn next_unanswered(&self) -> Option<usize> {
-        self.questions
-            .iter()
-            .enumerate()
-            .skip(self.current + 1)
-            .find(|(_, q)| q.status != "passed")
-            .map(|(i, _)| i)
+        if self.questions.is_empty() {
+            return None;
+        }
+        let needs = |i: usize| {
+            self.questions[i].status != "passed"
+                && self.slots.get(i).is_none_or(|s| s.pending.is_none())
+        };
+        let n = self.questions.len();
+        (1..=n)
+            .map(|offset| (self.current + offset) % n)
+            .find(|i| needs(*i) && *i != self.current)
     }
 
     /// Scroll the diff to the hunk this question is about, so the reader does
@@ -243,7 +350,7 @@ fn build_diff_view(diff: &str, ai_hunks: &[git::Hunk]) -> Vec<DiffLine> {
 
 const STATUS_ANSWERING: &str =
     "a answer · h hint · n/p hunk · [/] file · g back · ←/→ pan · q quit";
-const STATUS_ANSWERED: &str = "^s submit · e revise · h hint · n/p hunk · g back · q quit";
+const STATUS_ANSWERED: &str = "^s submit & move on · e revise · h hint · n/p hunk · g back · q quit";
 const STATUS_REVIEWING: &str = "space next · e revise · n/p hunk · g back · q quit";
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -302,7 +409,7 @@ fn editor_header(app: &App) -> String {
         out.push_str(&line);
         out.push('\n');
     }
-    for hint in q.hints.iter().take(app.hints_shown) {
+    for hint in q.hints.iter().take(app.hints_shown()) {
         out.push_str("#\n");
         for line in wrap_comment(&format!("hint: {hint}")) {
             out.push_str(&line);
@@ -371,21 +478,8 @@ pub fn run(
     ai_hunks: &[git::Hunk],
     questions: Vec<db::Question>,
 ) -> Result<Vec<f64>> {
-    let mut app = App {
-        current: App::first_unanswered(&questions),
-        scores: App::restored_scores(&questions),
-        questions,
-        answer: String::new(),
-        mode: Mode::Answering,
-        hints_shown: 0,
-        verdict: None,
-        diff: build_diff_view(&diff, ai_hunks),
-        scroll: 0,
-        hscroll: 0,
-        viewport: std::cell::Cell::new(20),
-        status: STATUS_ANSWERING.into(),
-        quit: false,
-    };
+    let view = build_diff_view(&diff, ai_hunks);
+    let mut app = App::new(questions, view);
     app.jump_to_anchor(ai_hunks);
 
     let (tx, rx): (Sender<AppEvent>, Receiver<AppEvent>) = mpsc::channel();
@@ -457,19 +551,40 @@ fn event_loop(
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 AppEvent::Graded { question_id, label, feedback } => {
-                    if let Some(i) = app.questions.iter().position(|q| q.id == question_id) {
-                        app.scores[i] = label.score();
-                    }
+                    let Some(i) = app.questions.iter().position(|q| q.id == question_id)
+                    else {
+                        continue;
+                    };
+                    // The answer as submitted, not whatever is in the slot now:
+                    // you are free to have revised it since.
+                    let graded = app.slots[i].pending.take().unwrap_or(Pending {
+                        answer: app.slots[i].answer.clone(),
+                        hints_used: app.slots[i].hints_shown,
+                    });
+                    app.scores[i] = label.score();
                     db::record_attempt(
-                        conn, question_id, "answer", &app.answer, app.hints_shown as i64,
+                        conn, question_id, "answer", &graded.answer,
+                        graded.hints_used as i64,
                         label.as_str(), label.score(), &feedback, judge.model(),
                     )?;
-                    app.verdict = Some((label, feedback));
-                    app.mode = Mode::Reviewing;
-                    app.status = STATUS_REVIEWING.into();
+                    // Mirror what the row now says, so the passed question is
+                    // skipped rather than offered again.
+                    if label.score() >= 0.6 {
+                        app.questions[i].status = "passed".into();
+                    }
+                    app.questions[i].label = Some(label.as_str().into());
+                    app.questions[i].score = Some(label.score());
+                    app.slots[i].verdict = Some((label, feedback));
+                    app.status = if i == app.current {
+                        STATUS_REVIEWING.into()
+                    } else {
+                        format!("question {} graded: {}", i + 1, label.as_str())
+                    };
                 }
-                AppEvent::Failed { error, .. } => {
-                    app.mode = Mode::Answering;
+                AppEvent::Failed { question_id, error } => {
+                    if let Some(i) = app.questions.iter().position(|q| q.id == question_id) {
+                        app.slots[i].pending = None;
+                    }
                     app.status = format!("grading failed: {error}");
                 }
             }
@@ -477,16 +592,20 @@ fn event_loop(
 
         let Some(key) = input.next(app)? else { continue };
 
-        // Grading is in flight: accept nothing but quit.
-        if app.mode == Mode::Grading {
-            if key.code == KeyCode::Char('q') || is_ctrl_c(&key) {
+        match (key.code, app.mode() == Mode::Reviewing) {
+            // Quitting with calls outstanding throws away answers that have
+            // already been paid for, so it takes a second press.
+            (KeyCode::Char('q'), _) => {
+                if app.in_flight() > 0 && !app.quit {
+                    app.quit = true;
+                    app.status = format!(
+                        "{} still grading — q again to abandon them",
+                        app.in_flight()
+                    );
+                    continue;
+                }
                 return Ok(());
             }
-            continue;
-        }
-
-        match (key.code, app.mode == Mode::Reviewing) {
-            (KeyCode::Char('q'), _) => return Ok(()),
             _ if is_ctrl_c(&key) => return Ok(()),
 
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.scroll_by(1),
@@ -506,47 +625,80 @@ fn event_loop(
             // Back to the hunk this question is about, after wandering off.
             (KeyCode::Char('g'), _) => app.jump_to_anchor(ai_hunks),
 
-            // Next question. Already-passed ones are skipped, since re-grading
-            // them costs a judge call and changes nothing.
-            (KeyCode::Char(' '), true) => {
-                let Some(next) = app.next_unanswered() else {
-                    return Ok(());
-                };
-                app.current = next;
-                app.answer.clear();
-                app.hints_shown = 0;
-                app.verdict = None;
-                app.mode = Mode::Answering;
-                app.status = STATUS_ANSWERING.into();
-                app.jump_to_anchor(ai_hunks);
+            // Next question that still needs you. Passed ones are skipped,
+            // since re-grading them costs a judge call and changes nothing, and
+            // so are the ones sitting with the judge.
+            (KeyCode::Char(' '), _) => {
+                if !advance(app, ai_hunks) {
+                    // Nothing left to answer. Anything still in flight has to
+                    // land first: its score decides whether the gate passes.
+                    if app.in_flight() == 0 {
+                        return Ok(());
+                    }
+                    app.status = format!("waiting on {} grading…", app.in_flight());
+                }
             }
 
             // Reveal the next hint. Tier 3 is half the answer, so stop there.
             (KeyCode::Char('h'), false) => {
                 let available = app.question().map(|q| q.hints.len()).unwrap_or(0);
-                if app.hints_shown < available {
-                    app.hints_shown += 1;
-                } else {
-                    app.status = "no more hints".into();
+                let shown = app.hints_shown();
+                match app.slot_mut() {
+                    Some(slot) if shown < available => slot.hints_shown += 1,
+                    _ => app.status = "no more hints".into(),
                 }
             }
 
             (KeyCode::Char('a'), _) | (KeyCode::Char('e'), _) => {
-                app.answer = ui.edit(&app.answer, &editor_header(app))?;
-                if !app.answer.is_empty() {
-                    app.mode = Mode::Answering;
-                    app.verdict = None;
+                // Revising an answer the judge is reading would mean showing a
+                // verdict against text that is no longer on screen.
+                if app.mode() == Mode::Grading {
+                    app.status = "this one is with the judge — space to move on".into();
+                    continue;
+                }
+                let edited = ui.edit(app.answer(), &editor_header(app))?;
+                let empty = edited.is_empty();
+                if let Some(slot) = app.slot_mut() {
+                    slot.answer = edited;
+                    if !empty {
+                        slot.verdict = None;
+                    }
+                }
+                if !empty {
                     app.status = STATUS_ANSWERED.into();
                 }
             }
 
-            (KeyCode::Char('s'), false) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                submit(app, judge, diff, ai_hunks, tx);
+            (KeyCode::Char('s'), _) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if app.mode() == Mode::Grading {
+                    app.status = "already grading this one".into();
+                    continue;
+                }
+                if submit(app, judge, diff, ai_hunks, tx) {
+                    // The judge takes tens of seconds. Move on rather than
+                    // watch it: that wait is the whole cost of the quiz.
+                    if advance(app, ai_hunks) {
+                        app.status = format!(
+                            "{STATUS_ANSWERING} · {} grading",
+                            app.in_flight()
+                        );
+                    }
+                }
             }
 
             _ => {}
         }
     }
+}
+
+/// Move to the next question that still needs answering. `false` when there is
+/// none, which leaves the current question where it is.
+fn advance(app: &mut App, ai_hunks: &[git::Hunk]) -> bool {
+    let Some(next) = app.next_unanswered() else { return false };
+    app.current = next;
+    app.status = STATUS_ANSWERING.into();
+    app.jump_to_anchor(ai_hunks);
+    true
 }
 
 fn is_ctrl_c(key: &event::KeyEvent) -> bool {
@@ -555,34 +707,43 @@ fn is_ctrl_c(key: &event::KeyEvent) -> bool {
 
 /// Spawn the judge call. The §8 precheck runs first, on this thread, because it
 /// costs nothing and needs no network.
+///
+/// `true` when the answer is now with the judge, so the caller can move on.
 fn submit(
     app: &mut App,
     judge: &Arc<dyn llm::Judge + Send + Sync>,
     diff: &Arc<String>,
     ai_hunks: &[git::Hunk],
     tx: &Sender<AppEvent>,
-) {
-    let Some(q) = app.question().cloned() else { return };
-    if app.answer.trim().is_empty() {
+) -> bool {
+    let Some(q) = app.question().cloned() else { return false };
+    if app.answer().trim().is_empty() {
         app.status = "nothing to submit — press a to write an answer".into();
-        return;
+        return false;
     }
 
-    if !llm::cites_the_diff(&app.answer, ai_hunks) {
+    let pending = Pending {
+        answer: app.answer().to_string(),
+        hints_used: app.hints_shown(),
+    };
+    if let Some(slot) = app.slot_mut() {
+        slot.pending = Some(pending);
+        slot.verdict = None;
+    }
+
+    if !llm::cites_the_diff(app.answer(), ai_hunks) {
         let _ = tx.send(AppEvent::Graded {
             question_id: q.id,
             label: llm::Label::Wrong,
             feedback: "Cites nothing from the diff — name an identifier, file or line.".into(),
         });
-        app.mode = Mode::Grading;
-        return;
+        return true;
     }
 
-    app.mode = Mode::Grading;
     app.status = "grading…".into();
 
     let tx = tx.clone();
-    let answer = app.answer.clone();
+    let answer = app.answer().to_string();
     let text = q.text.clone();
     let id = q.id;
     let judge = Arc::clone(judge);
@@ -605,6 +766,7 @@ fn submit(
         };
         let _ = tx.send(ev);
     });
+    true
 }
 
 /// Build a diff view for render tests, marking the given hunk indexes as
@@ -643,7 +805,7 @@ pub fn run_headless(
         fn next(&mut self, app: &App) -> Result<Option<event::KeyEvent>> {
             // A judge call is in flight. Hold, as a person would, so the verdict
             // is processed before the next key is delivered.
-            if app.mode == Mode::Grading && self.wait_for_grading {
+            if app.in_flight() > 0 && self.wait_for_grading {
                 self.polls += 1;
                 if self.polls > 20_000 {
                     anyhow::bail!("a scripted judge call never returned");
@@ -656,7 +818,7 @@ pub fn run_headless(
                 Some(k) => Ok(Some(k)),
                 // Out of keys. If something is still in flight, hold for it so
                 // the verdict lands before the loop stops.
-                None if app.mode == Mode::Grading => {
+                None if app.in_flight() > 0 => {
                     std::thread::sleep(Duration::from_millis(1));
                     Ok(None)
                 }
@@ -668,22 +830,10 @@ pub fn run_headless(
         }
     }
 
-    let total = questions.len();
-    let mut app = App {
-        questions,
-        current: 0,
-        answer: String::new(),
-        mode: Mode::Answering,
-        hints_shown: 0,
-        verdict: None,
-        scores: vec![0.0; total],
-        diff: build_diff_view(&diff, ai_hunks),
-        scroll: 0,
-        hscroll: 0,
-        viewport: std::cell::Cell::new(20),
-        status: String::new(),
-        quit: false,
-    };
+    let mut app = App::new(questions, build_diff_view(&diff, ai_hunks));
+    app.current = 0;
+    app.scores = vec![0.0; app.questions.len()];
+    app.status = String::new();
     let (tx, rx) = mpsc::channel();
     event_loop(
         &mut Editor::Headless,
@@ -759,8 +909,8 @@ diff --git a/src/mine.rs b/src/mine.rs
     fn jumping_scrolls_to_the_questions_hunk() {
         let hunks = git::parse_diff(DIFF);
         let target = hunks.iter().find(|h| h.file == "src/mine.rs").unwrap();
-        let mut app = App {
-            questions: vec![db::Question {
+        let mut app = App::new(
+            vec![db::Question {
                 id: 1,
                 kind: "prediction".into(),
                 file: target.file.clone(),
@@ -772,20 +922,10 @@ diff --git a/src/mine.rs b/src/mine.rs
                 label: None,
                 score: None,
             }],
-            current: 0,
-            answer: String::new(),
-            mode: Mode::Answering,
-            hints_shown: 0,
-            verdict: None,
-            scores: vec![0.0],
-            diff: build_diff_view(DIFF, &hunks),
-            scroll: 0,
-            hscroll: 0,
-            // Smaller than the diff, or the clamp pins every jump to the top.
-            viewport: std::cell::Cell::new(4),
-            status: String::new(),
-            quit: false,
-        };
+            build_diff_view(DIFF, &hunks),
+        );
+        // Smaller than the diff, or the clamp pins every jump to the top.
+        app.viewport = std::cell::Cell::new(4);
         app.jump_to_anchor(&hunks);
 
         // Must land on src/mine.rs's hunk, not on src/ai.rs's identical header.
@@ -884,7 +1024,7 @@ diff --git a/sync.rs b/sync.rs
             vec![key('a'), ctrl('s')],
         );
         assert_eq!(app.scores[0], Label::Demonstrates.score());
-        assert!(matches!(app.verdict, Some((Label::Demonstrates, _))));
+        assert!(matches!(app.verdict(), Some((Label::Demonstrates, _))));
     }
 
     /// The precheck must run on the UI thread and cost nothing — an answer
@@ -892,14 +1032,8 @@ diff --git a/sync.rs b/sync.rs
     #[test]
     fn an_answer_citing_nothing_is_rejected_without_consulting_the_judge() {
         let (conn, hunks, questions) = fixture(1);
-        let mut app = App {
-            questions, current: 0,
-            answer: "This could fail and leave state inconsistent.".into(),
-            mode: Mode::Answering, hints_shown: 0, verdict: None, scores: vec![0.0],
-            diff: build_diff_view(DIFF, &hunks), scroll: 0, hscroll: 0,
-            viewport: std::cell::Cell::new(40),
-            status: String::new(), quit: false,
-        };
+        let mut app = App::new(questions, build_diff_view(DIFF, &hunks));
+        app.slots[0].answer = "This could fail and leave state inconsistent.".into();
         let (tx, rx) = mpsc::channel();
         // A judge scripted to fail: reaching it would surface as an error.
         let judge: Arc<dyn llm::Judge + Send + Sync> =
@@ -921,7 +1055,7 @@ diff --git a/sync.rs b/sync.rs
             vec![key('a'), ctrl('s')],
         );
         assert!(app.status.contains("grading failed"), "status: {}", app.status);
-        assert_eq!(app.mode, Mode::Answering);
+        assert_eq!(app.mode(), Mode::Answering);
     }
 
     #[test]
@@ -932,32 +1066,112 @@ diff --git a/sync.rs b/sync.rs
             vec![key('a'), ctrl('s'), key(' ')],
         );
         assert_eq!(app.current, 1);
-        assert!(app.answer.is_empty());
-        assert!(app.verdict.is_none());
-        assert_eq!(app.mode, Mode::Answering);
+        assert!(app.answer().is_empty());
+        assert!(app.verdict().is_none());
+        assert_eq!(app.mode(), Mode::Answering);
     }
 
-    /// While a call is in flight the loop must keep running and ignore input —
-    /// not block, and not accept a second submit.
-    /// Keys that land while a judge call is in flight must be dropped, not
-    /// queued and acted on when it returns.
+    /// A judge call takes tens of seconds. Submitting moves straight to the
+    /// next question and grades the last one behind you — the whole point of
+    /// running the call in the background.
     #[test]
-    fn input_is_ignored_while_grading_is_in_flight() {
+    fn submitting_moves_on_while_the_judge_is_still_working() {
         let (conn, hunks, questions) = fixture(2);
         let app = run_headless(
             &conn,
             Arc::new(
-                llm::stub::StubJudge::scripted([Some(Label::Partial)])
+                llm::stub::StubJudge::scripted([Some(Label::Partial), Some(Label::Partial)])
                     .with_delay(Duration::from_millis(150)),
             ),
             Arc::new(DIFF.to_string()),
             &hunks,
             questions,
-            vec![key('a'), ctrl('s'), key(' '), key(' '), key(' ')],
+            vec![key('a'), ctrl('s'), key('a')],
             false,
         )
         .unwrap();
-        assert_eq!(app.current, 0, "advanced while a judge call was in flight");
+        assert_eq!(app.current, 1, "did not move on while the judge worked");
+        assert!(!app.slots[1].answer.is_empty(), "could not answer question 2");
+    }
+
+    /// The verdict belongs to the question it was asked about, not to whatever
+    /// is on screen when it lands.
+    #[test]
+    fn a_verdict_lands_on_its_own_question_after_moving_on() {
+        let (conn, hunks, questions) = fixture(2);
+        let ids: Vec<i64> = questions.iter().map(|q| q.id).collect();
+        let app = run_headless(
+            &conn,
+            Arc::new(
+                llm::stub::StubJudge::scripted([Some(Label::Demonstrates)])
+                    .with_delay(Duration::from_millis(50)),
+            ),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('a'), ctrl('s')],
+            true,
+        )
+        .unwrap();
+        assert_eq!(app.scores[0], Label::Demonstrates.score());
+        assert!(app.slots[0].verdict.is_some(), "verdict missed question 1");
+        assert!(app.slots[1].verdict.is_none(), "verdict landed on question 2");
+        // Recorded against the answer that was actually graded.
+        assert!(db::last_answer(&conn, ids[0]).unwrap().is_some());
+        assert!(db::last_answer(&conn, ids[1]).unwrap().is_none());
+    }
+
+    /// Quitting with a call outstanding throws away an answer that has already
+    /// been paid for, so the first press only warns.
+    #[test]
+    fn quitting_with_a_call_outstanding_takes_two_presses() {
+        let (conn, hunks, questions) = fixture(2);
+        let app = run_headless(
+            &conn,
+            Arc::new(
+                llm::stub::StubJudge::scripted([Some(Label::Partial)])
+                    .with_delay(Duration::from_millis(120)),
+            ),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('a'), ctrl('s'), key('q')],
+            false,
+        )
+        .unwrap();
+        // The warning is armed rather than the loop exiting: the outstanding
+        // verdict still lands and is recorded.
+        assert!(app.quit, "the first q did not arm the warning");
+        assert_eq!(app.in_flight(), 0, "quit before the verdict landed");
+        assert_eq!(app.scores[0], Label::Partial.score());
+    }
+
+    /// Revising an answer the judge is already reading would show a verdict
+    /// against text that is no longer on screen.
+    #[test]
+    fn the_answer_is_frozen_while_it_is_with_the_judge() {
+        let (conn, hunks, questions) = fixture(1);
+        let app = run_headless(
+            &conn,
+            Arc::new(
+                llm::stub::StubJudge::scripted([Some(Label::Partial)])
+                    .with_delay(Duration::from_millis(120)),
+            ),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('a'), ctrl('s'), ctrl('s')],
+            false,
+        )
+        .unwrap();
+        // One attempt, not two: the second ^s was refused rather than buying a
+        // second verdict on the same answer. The judge is scripted with a
+        // single reply, so a second call would come back as a failure.
+        let attempts: i64 = conn
+            .query_row("SELECT count(*) FROM attempts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, 1, "the answer was graded twice");
+        assert_eq!(app.scores[0], Label::Partial.score());
     }
 
     #[test]
@@ -974,7 +1188,7 @@ diff --git a/sync.rs b/sync.rs
             true,
         )
         .unwrap();
-        assert_eq!(app.hints_shown, 2);
+        assert_eq!(app.hints_shown(), 2);
         assert!(app.status.contains("no more hints"));
     }
 
@@ -1010,21 +1224,10 @@ diff --git a/b.rs b/b.rs
     }
 
     fn app_with(viewport: u16) -> App {
-        App {
-            questions: vec![],
-            current: 0,
-            answer: String::new(),
-            mode: Mode::Answering,
-            hints_shown: 0,
-            verdict: None,
-            scores: vec![],
-            diff: view(),
-            scroll: 0,
-            hscroll: 0,
-            viewport: std::cell::Cell::new(viewport),
-            status: String::new(),
-            quit: false,
-        }
+        let mut app = App::new(vec![], view());
+        app.viewport = std::cell::Cell::new(viewport);
+        app.status = String::new();
+        app
     }
 
     fn numbered(text: &str) -> Option<u32> {
@@ -1225,28 +1428,36 @@ mod resume_tests {
 
     #[test]
     fn advancing_skips_questions_that_already_passed() {
-        let mut app = App {
-            questions: vec![
+        let mut app = App::new(
+            vec![
                 q(1, "open", None),
                 q(2, "passed", Some(0.9)),
                 q(3, "open", None),
             ],
-            current: 0,
-            answer: String::new(),
-            mode: Mode::Answering,
-            hints_shown: 0,
-            verdict: None,
-            scores: vec![0.0; 3],
-            diff: vec![],
-            scroll: 0,
-            hscroll: 0,
-            viewport: std::cell::Cell::new(10),
-            status: String::new(),
-            quit: false,
-        };
+            vec![],
+        );
+        app.current = 0;
         assert_eq!(app.next_unanswered(), Some(2), "should skip the passed one");
         app.current = 2;
+        // Wraps: question 1 is still open, and with grading in the background
+        // its verdict may have landed long after you moved past it.
+        assert_eq!(app.next_unanswered(), Some(0));
+        app.questions[0].status = "passed".into();
+        app.questions[2].status = "passed".into();
         assert_eq!(app.next_unanswered(), None, "nothing left to ask");
+    }
+
+    /// A question already with the judge is not offered again — that would buy
+    /// a second verdict on the same question at full price.
+    #[test]
+    fn advancing_skips_questions_already_with_the_judge() {
+        let mut app = App::new(
+            vec![q(1, "open", None), q(2, "open", None), q(3, "open", None)],
+            vec![],
+        );
+        app.current = 0;
+        app.slots[1].pending = Some(Pending { answer: "a".into(), hints_used: 0 });
+        assert_eq!(app.next_unanswered(), Some(2));
     }
 }
 
@@ -1256,21 +1467,9 @@ mod editor_tests {
 
     fn app(hints_shown: usize) -> App {
         let q = crate::tui::quiz::tests::question();
-        App {
-            questions: vec![q],
-            current: 0,
-            answer: String::new(),
-            mode: Mode::Answering,
-            hints_shown,
-            verdict: None,
-            scores: vec![0.0],
-            diff: Vec::new(),
-            scroll: 0,
-            hscroll: 0,
-            viewport: std::cell::Cell::new(20),
-            status: String::new(),
-            quit: false,
-        }
+        let mut app = App::new(vec![q], Vec::new());
+        app.slots[0].hints_shown = hints_shown;
+        app
     }
 
     #[test]

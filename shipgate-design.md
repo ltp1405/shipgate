@@ -376,6 +376,13 @@ After submit: label, feedback, and the reference revealed on `demonstrates` or a
 
 **No blocking calls on the UI thread.** Each request runs on a `std::thread::spawn` writing into an `mpsc::Sender<AppEvent>`; the event loop selects over `crossterm::event::poll(16ms)` and `rx.try_recv()`. `reqwest::blocking` stays inside `llm/`. Without this the terminal freezes 5–30s per judge call with no redraw and no Ctrl-C.
 
+**Grading runs behind you.** Submitting moves straight to the next question and leaves the judge call outstanding; several can be in flight at once. Waiting on each verdict costs 5–30s per question of doing nothing, which at three questions is most of the time the quiz takes. Consequences:
+
+- Answer, hints and verdict are per question (`Slot`), not one set of values on the app. The answer as submitted is held with the pending call, so the attempt is recorded against the text that was actually graded even after you have revised it.
+- The question with the judge is frozen: no re-submit, no revision. A verdict shown against text no longer on screen is worse than waiting.
+- A verdict landing on a question you have moved past updates its score and says so in the status line rather than hijacking the screen.
+- The quiz cannot end while a call is outstanding — its score decides whether the gate clears — so `q` with one in flight warns once and takes a second press.
+
 ## 13. Cost
 
 **Measured, not estimated — but read the unit carefully.** Model calls go through the Claude Code CLI (`claude -p`), which uses its own credentials.

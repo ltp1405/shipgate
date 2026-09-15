@@ -145,7 +145,7 @@ fn render_question(f: &mut Frame, app: &App, area: Rect) {
         Style::default().add_modifier(Modifier::BOLD),
     )));
 
-    for hint in q.hints.iter().take(app.hints_shown) {
+    for hint in q.hints.iter().take(app.hints_shown()) {
         top.push(Line::from(""));
         top.push(Line::from(Span::styled(
             format!("hint: {hint}"),
@@ -153,7 +153,7 @@ fn render_question(f: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
-    if let Some((label, feedback)) = &app.verdict {
+    if let Some((label, feedback)) = app.verdict() {
         top.push(Line::from(""));
         top.push(Line::from(Span::styled(label.as_str(), label_style(*label))));
         top.push(Line::from(Span::styled(
@@ -180,20 +180,27 @@ fn render_question(f: &mut Frame, app: &App, area: Rect) {
     );
     f.render_widget(
         Paragraph::new(top)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    // Grading runs in the background, so the state of the other
+                    // questions is no longer implied by which one is on screen.
+                    .title_bottom(format!(" {} ", app.progress())),
+            )
             .wrap(Wrap { trim: false }),
         rows[0],
     );
 
-    let (body, style) = if app.mode == Mode::Grading {
+    let (body, style) = if app.mode() == Mode::Grading {
         ("grading…".to_string(), Style::default().fg(Color::Yellow))
-    } else if app.answer.is_empty() {
+    } else if app.answer().is_empty() {
         (
             "press a to write your answer in $EDITOR".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     } else {
-        (app.answer.clone(), Style::default())
+        (app.answer().to_string(), Style::default())
     };
 
     f.render_widget(
@@ -208,7 +215,7 @@ fn render_question(f: &mut Frame, app: &App, area: Rect) {
 pub(crate) mod tests {
     use super::*;
     use crate::db;
-    use crate::tui::{App, Mode};
+    use crate::tui::App;
     use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
     const W: u16 = 100;
@@ -230,16 +237,10 @@ pub(crate) mod tests {
     }
 
     fn app() -> App {
-        App {
-            questions: vec![question()],
-            current: 0,
-            answer: String::new(),
-            mode: Mode::Answering,
-            hints_shown: 0,
-            verdict: None,
-            scores: vec![0.0],
+        let mut app = App::new(
+            vec![question()],
             // Two files, so the hand-typed one can sit outside the AI scope.
-            diff: crate::tui::build_diff_view_for_test(
+            crate::tui::build_diff_view_for_test(
                 "diff --git a/src/sync.rs b/src/sync.rs\n\
                  @@ -88,1 +88,2 @@\n\
                  +AIAUTHOREDLINE\n\
@@ -248,12 +249,10 @@ pub(crate) mod tests {
                  +HANDTYPEDLINE\n",
                 &[0],
             ),
-            scroll: 0,
-            hscroll: 0,
-            viewport: std::cell::Cell::new(H - 3),
-            status: "STATUSLINE".into(),
-            quit: false,
-        }
+        );
+        app.viewport = std::cell::Cell::new(H - 3);
+        app.status = "STATUSLINE".into();
+        app
     }
 
     pub(super) fn draw(app: &App, w: u16, h: u16) -> Buffer {
@@ -341,7 +340,7 @@ pub(crate) mod tests {
     fn hints_appear_only_once_revealed() {
         let mut a = app();
         assert!(!contains(&draw(&a, W, H), "HINTONE"));
-        a.hints_shown = 1;
+        a.slots[0].hints_shown = 1;
         let buf = draw(&a, W, H);
         assert!(contains(&buf, "HINTONE"));
         assert!(!contains(&buf, "HINTTWO"), "revealed more hints than asked for");
@@ -352,14 +351,14 @@ pub(crate) mod tests {
     fn the_reference_is_hidden_until_the_answer_demonstrates_understanding() {
         let mut a = app();
         for label in [Label::Wrong, Label::Restates, Label::Partial] {
-            a.verdict = Some((label, "feedback".into()));
+            a.slots[0].verdict = Some((label, "feedback".into()));
             assert!(
                 !contains(&draw(&a, W, H), "REFERENCEANSWERTEXT"),
                 "reference leaked at {}",
                 label.as_str()
             );
         }
-        a.verdict = Some((Label::Demonstrates, "feedback".into()));
+        a.slots[0].verdict = Some((Label::Demonstrates, "feedback".into()));
         assert!(contains(&draw(&a, W, H), "REFERENCEANSWERTEXT"));
     }
 
@@ -372,7 +371,7 @@ pub(crate) mod tests {
             (Label::Restates, Color::Magenta),
             (Label::Wrong, Color::Red),
         ] {
-            a.verdict = Some((label, "feedback".into()));
+            a.slots[0].verdict = Some((label, "feedback".into()));
             let buf = draw(&a, W, H);
             assert_eq!(
                 style_of(&buf, label.as_str()).fg,
@@ -386,11 +385,31 @@ pub(crate) mod tests {
     #[test]
     fn a_call_in_flight_is_visible_in_the_answer_pane() {
         let mut a = app();
-        a.answer = "SOMEANSWER".into();
-        a.mode = Mode::Grading;
+        a.slots[0].answer = "SOMEANSWER".into();
+        a.slots[0].pending = Some(crate::tui::Pending {
+            answer: "SOMEANSWER".into(),
+            hints_used: 0,
+        });
         let buf = draw(&a, W, H);
         assert!(contains(&buf, "grading"));
         assert!(!contains(&buf, "SOMEANSWER"), "answer shown while grading");
+    }
+
+    /// With grading in the background, which questions are done, outstanding
+    /// or untouched is no longer implied by the one on screen.
+    #[test]
+    fn the_footer_states_every_questions_state() {
+        let mut a = app();
+        a.questions.push(question());
+        a.questions.push(question());
+        a.slots = vec![crate::tui::Slot::default(); 3];
+        a.questions[0].status = "passed".into();
+        a.slots[1].pending = Some(crate::tui::Pending {
+            answer: "x".into(),
+            hints_used: 0,
+        });
+        assert_eq!(a.progress(), "1+ 2~ 3.");
+        assert!(contains(&draw(&a, W, H), "1+ 2~ 3."));
     }
 
     #[test]
@@ -425,26 +444,18 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod diff_render_tests {
     use super::tests::{draw, rows};
-    use crate::tui::{App, Mode};
+    use crate::tui::App;
 
     const LONG: &str = "diff --git a/f.rs b/f.rs\n@@ -1,1 +7,2 @@\n+ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz\n";
 
     fn long_app() -> App {
-        App {
-            questions: vec![super::tests::question()],
-            current: 0,
-            answer: String::new(),
-            mode: Mode::Answering,
-            hints_shown: 0,
-            verdict: None,
-            scores: vec![0.0],
-            diff: crate::tui::build_diff_view_for_test(LONG, &[0]),
-            scroll: 0,
-            hscroll: 0,
-            viewport: std::cell::Cell::new(10),
-            status: "s".into(),
-            quit: false,
-        }
+        let mut app = App::new(
+            vec![super::tests::question()],
+            crate::tui::build_diff_view_for_test(LONG, &[0]),
+        );
+        app.viewport = std::cell::Cell::new(10);
+        app.status = "s".into();
+        app
     }
 
     #[test]
