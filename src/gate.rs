@@ -544,7 +544,8 @@ impl Ready {
     }
 
     /// §10 — built from your answers, not the reference answers, and not a
-    /// summary of the diff.
+    /// summary of the diff. Returns the shipgate section alone; `merge_into`
+    /// puts it in the description without disturbing what is already there.
     fn description(
         &self,
         conn: &Connection,
@@ -607,9 +608,20 @@ impl Ready {
         Ok(body)
     }
 
-    fn submit(&self, dir: &Path, pr: &gh::Pr, body: &str) -> Result<()> {
+    fn submit(&self, dir: &Path, pr: &gh::Pr, section: &str) -> Result<()> {
+        // What the description says now, not what it said when the gate was
+        // created. The quiz takes minutes, and a description written in the
+        // meantime — by you, by a template, by a bot — is not ours to throw
+        // away. A failed read is treated as an empty description rather than
+        // blocking the submission, and the editor shows the result either way.
+        let existing = gh::pr_body(dir, pr.number).unwrap_or_else(|e| {
+            eprintln!("warning: could not read the current description ({e}) — writing ours alone");
+            String::new()
+        });
+        let body = merge_into(&existing, section);
+
         let path = std::env::temp_dir().join(format!("shipgate-pr-{}.md", pr.number));
-        std::fs::write(&path, body)?;
+        std::fs::write(&path, &body)?;
 
         // Never posted unread.
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
@@ -634,6 +646,37 @@ impl Ready {
         Ok(())
     }
 }
+
+/// §10 — put the shipgate section into a description that may already say
+/// something, and put it in the same place every time.
+///
+/// Between the markers is ours and is replaced; everything else is the author's
+/// and is kept byte for byte. Without the markers a second run appends a second
+/// copy, and the description grows a section per re-quiz.
+fn merge_into(existing: &str, section: &str) -> String {
+    let block = format!("{BEGIN}\n{}\n{END}", section.trim_end());
+    let trimmed = existing.trim();
+
+    if let Some(start) = existing.find(BEGIN) {
+        // An end marker before the start marker, or none at all, means the
+        // description has been edited into a shape we cannot reason about.
+        // Appending is wrong but recoverable; guessing at the boundary and
+        // cutting the author's text is not.
+        if let Some(rel) = existing[start..].find(END) {
+            let end = start + rel + END.len();
+            return format!("{}{block}{}", &existing[..start], &existing[end..]);
+        }
+    }
+    if trimmed.is_empty() {
+        return block;
+    }
+    format!("{trimmed}\n\n{block}")
+}
+
+/// Markers, not a heading: a heading is something the author might reasonably
+/// write themselves, and mistaking theirs for ours would delete it.
+const BEGIN: &str = "<!-- shipgate:begin -->";
+const END: &str = "<!-- shipgate:end -->";
 
 /// The dashboard. Unlike every other entry point this has no working directory
 /// to infer from, so each row carries the path it belongs to and the quiz runs
@@ -763,6 +806,56 @@ mod tests {
     #[test]
     fn the_dropped_one_still_has_a_floor() {
         assert!(!passes(&[0.9, 0.9, 0.0]));
+    }
+
+    /// The description is the author's, not ours. A PR that already says
+    /// something — a template, a screenshot, a note to the reviewer — keeps it.
+    #[test]
+    fn an_existing_description_is_kept() {
+        let out = super::merge_into("Fixes #42.\n\n![screenshot](x.png)", "## What this changes\n\nthings");
+        assert!(out.starts_with("Fixes #42.\n\n![screenshot](x.png)"), "{out}");
+        assert!(out.contains("## What this changes"));
+    }
+
+    /// Re-running must replace our section, not stack another copy under it.
+    #[test]
+    fn a_second_run_replaces_only_our_own_section() {
+        let first = super::merge_into("Author's notes.", "first section");
+        let second = super::merge_into(&first, "second section");
+        assert!(second.contains("Author's notes."));
+        assert!(second.contains("second section"));
+        assert!(!second.contains("first section"), "the old section was left behind");
+        assert_eq!(second.matches(super::BEGIN).count(), 1, "markers accumulated");
+    }
+
+    /// Text the author added after our section is theirs too, and survives a
+    /// re-run that rewrites the middle.
+    #[test]
+    fn text_on_both_sides_of_the_section_survives() {
+        let first = super::merge_into("above", "ours");
+        let edited = format!("{first}\n\nbelow");
+        let second = super::merge_into(&edited, "ours again");
+        assert!(second.starts_with("above"), "{second}");
+        assert!(second.trim_end().ends_with("below"), "{second}");
+        assert!(second.contains("ours again"));
+    }
+
+    #[test]
+    fn an_empty_description_gets_the_section_alone() {
+        let out = super::merge_into("   \n", "ours");
+        assert!(out.starts_with(super::BEGIN));
+        assert!(out.trim_end().ends_with(super::END));
+    }
+
+    /// A half-deleted marker pair leaves no boundary we can trust. Appending a
+    /// duplicate is untidy; guessing where our section ended would cut the
+    /// author's text.
+    #[test]
+    fn a_broken_marker_pair_appends_rather_than_guessing() {
+        let mangled = format!("{} stray text with no end", super::BEGIN);
+        let out = super::merge_into(&mangled, "ours");
+        assert!(out.contains("stray text with no end"), "author text was cut: {out}");
+        assert!(out.contains("ours"));
     }
 
     /// An empty score list is a pass — no questions, nothing failed — which is

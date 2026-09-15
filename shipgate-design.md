@@ -354,6 +354,10 @@ The coverage line ships in the description too. If a reviewer — or future you 
 
 One LLM call turns raw answers into prose. The assembled text opens in `$EDITOR` before submission, never posted unread. Then `gh pr edit --body-file` and `gh pr ready`.
 
+**It does not overwrite the description.** What shipgate writes lives between `<!-- shipgate:begin -->` and `<!-- shipgate:end -->`; everything outside is the author's and is kept byte for byte, so a template, a linked issue, a screenshot or a note to the reviewer survives clearing the gate. A re-quiz replaces the section rather than appending a second copy.
+
+The current description is read at submission time, not when the gate was created — a quiz takes minutes and anything written in between is not ours to discard. Markers rather than a heading, because a heading is something an author might write themselves and mistaking theirs for ours would delete it; and if the pair has been half-deleted, the section is appended rather than guessing at a boundary and cutting text.
+
 Upheld `code_bug` findings go to `~/.local/share/shipgate/notes/<repo>-<pr>.md` and are listed under **Known issues**.
 
 ## 11. `status` and `stats`
