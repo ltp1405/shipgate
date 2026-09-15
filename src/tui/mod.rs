@@ -285,11 +285,71 @@ fn restore(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
+/// The question, as `#` lines below the answer — what git does with the changes
+/// in COMMIT_EDITMSG. $EDITOR covers the quiz screen, so without this you
+/// compose the answer from memory of a question you can no longer see.
+fn editor_header(app: &App) -> String {
+    let Some(q) = app.question() else { return String::new() };
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# Question {}/{} · {} · {}\n#\n",
+        app.current + 1,
+        app.questions.len(),
+        q.kind,
+        q.file
+    ));
+    for line in wrap_comment(&q.text) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    for hint in q.hints.iter().take(app.hints_shown) {
+        out.push_str("#\n");
+        for line in wrap_comment(&format!("hint: {hint}")) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out.push_str("#\n# The `#` block at the end of this file is stripped.\n");
+    out
+}
+
+/// Wrap at 72 columns, the width a commit message editor assumes.
+fn wrap_comment(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::from("#");
+    for word in text.split_whitespace() {
+        if cur.len() + 1 + word.len() > 72 && cur != "#" {
+            lines.push(std::mem::take(&mut cur));
+            cur.push('#');
+        }
+        cur.push(' ');
+        cur.push_str(word);
+    }
+    if cur != "#" {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Drop the trailing run of `#` lines the header put there. Only the trailing
+/// run: an answer can legitimately start a line with `#` — `#[derive(...)]` in
+/// quoted Rust — and eating that would silently corrupt the answer.
+fn strip_comments(body: &str) -> String {
+    let mut lines: Vec<&str> = body.lines().collect();
+    while lines
+        .last()
+        .is_some_and(|l| l.starts_with('#') || l.trim().is_empty())
+    {
+        lines.pop();
+    }
+    lines.join("\n").trim().to_string()
+}
+
 /// Drop the terminal out of raw mode, run $EDITOR on the answer, then restore.
 /// A terminal textarea is a poor place to compose technical prose.
-fn edit_externally(terminal: &mut Term, current: &str) -> Result<String> {
+fn edit_externally(terminal: &mut Term, current: &str, header: &str) -> Result<String> {
     let path = std::env::temp_dir().join(format!("shipgate-answer-{}.md", std::process::id()));
-    std::fs::write(&path, current)?;
+    std::fs::write(&path, format!("{current}\n\n{header}"))?;
 
     restore(terminal)?;
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
@@ -298,7 +358,7 @@ fn edit_externally(terminal: &mut Term, current: &str) -> Result<String> {
     terminal.clear()?;
 
     match status {
-        Ok(s) if s.success() => Ok(std::fs::read_to_string(&path)?.trim().to_string()),
+        Ok(s) if s.success() => Ok(strip_comments(&std::fs::read_to_string(&path)?)),
         _ => Ok(current.to_string()),
     }
 }
@@ -362,9 +422,9 @@ impl Editor<'_> {
         Ok(())
     }
 
-    fn edit(&mut self, current: &str) -> Result<String> {
+    fn edit(&mut self, current: &str, header: &str) -> Result<String> {
         match self {
-            Editor::Terminal(t) => edit_externally(t, current),
+            Editor::Terminal(t) => edit_externally(t, current, header),
             // Headless: stand in for what the editor would have produced, so the
             // answer path can be driven without spawning one.
             Editor::Headless => Ok(if current.is_empty() {
@@ -472,7 +532,7 @@ fn event_loop(
             }
 
             (KeyCode::Char('a'), _) | (KeyCode::Char('e'), _) => {
-                app.answer = ui.edit(&app.answer)?;
+                app.answer = ui.edit(&app.answer, &editor_header(app))?;
                 if !app.answer.is_empty() {
                     app.mode = Mode::Answering;
                     app.verdict = None;
@@ -1187,5 +1247,71 @@ mod resume_tests {
         assert_eq!(app.next_unanswered(), Some(2), "should skip the passed one");
         app.current = 2;
         assert_eq!(app.next_unanswered(), None, "nothing left to ask");
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+
+    fn app(hints_shown: usize) -> App {
+        let q = crate::tui::quiz::tests::question();
+        App {
+            questions: vec![q],
+            current: 0,
+            answer: String::new(),
+            mode: Mode::Answering,
+            hints_shown,
+            verdict: None,
+            scores: vec![0.0],
+            diff: Vec::new(),
+            scroll: 0,
+            hscroll: 0,
+            viewport: std::cell::Cell::new(20),
+            status: String::new(),
+            quit: false,
+        }
+    }
+
+    #[test]
+    fn the_header_states_the_question_being_answered() {
+        let h = editor_header(&app(0));
+        assert!(h.contains("Question 1/1 · prediction · src/sync.rs"), "{h}");
+        assert!(h.contains("WHATDOESTHECALLEROBSERVE"), "{h}");
+        assert!(h.lines().all(|l| l.starts_with('#')), "{h}");
+    }
+
+    /// Unrevealed hints are the point of hints. The header must not leak them.
+    #[test]
+    fn only_revealed_hints_reach_the_editor() {
+        assert!(!editor_header(&app(0)).contains("HINTONE"));
+        let one = editor_header(&app(1));
+        assert!(one.contains("HINTONE"));
+        assert!(!one.contains("HINTTWO"));
+    }
+
+    #[test]
+    fn long_question_text_is_wrapped_and_still_commented() {
+        let long = "word ".repeat(40);
+        let lines = wrap_comment(&long);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|l| l.starts_with("# ") && l.len() <= 72));
+    }
+
+    #[test]
+    fn the_header_is_stripped_back_off() {
+        let body = format!("my answer\n\n{}", editor_header(&app(1)));
+        assert_eq!(strip_comments(&body), "my answer");
+    }
+
+    /// A `#` line inside the answer — `#[derive(...)]` in quoted Rust — is not
+    /// a comment and must survive.
+    #[test]
+    fn a_hash_line_inside_the_answer_survives() {
+        let body = "the struct is\n\n#[derive(Debug)]\nstruct A;\n\n# Question 1/1\n# text\n";
+        assert_eq!(
+            strip_comments(body),
+            "the struct is\n\n#[derive(Debug)]\nstruct A;"
+        );
     }
 }

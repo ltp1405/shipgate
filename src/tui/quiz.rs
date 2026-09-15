@@ -205,7 +205,7 @@ fn render_question(f: &mut Frame, app: &App, area: Rect) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db;
     use crate::tui::{App, Mode};
@@ -214,7 +214,7 @@ mod tests {
     const W: u16 = 100;
     const H: u16 = 30;
 
-    pub(super) fn question() -> db::Question {
+    pub(crate) fn question() -> db::Question {
         db::Question {
             id: 1,
             kind: "prediction".into(),
