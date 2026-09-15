@@ -286,9 +286,11 @@ This is a mitigation, not a fix. The real defence is `checkable` questions, whos
 
 **Borderline re-judge.** At `partial` — the label that decides a pass under drop-lowest — re-judge twice and take the median label. An earlier draft said "at temperature 0"; there is no temperature control through the CLI, so the re-runs are plain repeats and the median is taken over the model's natural variance. A failed re-judge keeps the first label rather than failing the answer.
 
-**Pass rule: drop-lowest, not min.** All but one question at `partial` or better, and the dropped one no worse than `restates`.
+**Pass rule: drop the lowest `n / 3`, not min.** The rest at `partial` or better, and every dropped one no worse than `restates` — forgiven is not ignored, so a `wrong` answer blocks at any count.
 
-v1 required every question ≥ 0.7. If per-question judging misfires on a good answer 10% of the time, that blocks a legitimate PR 27% of the time at three questions and 41% at five; a tolerable 10% gate-level false-block rate under min would need a 2% per-question false-fail rate, which no free-text judge delivers. Drop-lowest keeps the intent — you cannot ace two and whiff the one that matters — at roughly 92% under the same noise.
+v1 required every question ≥ 0.7. If per-question judging misfires on a good answer 10% of the time, that blocks a legitimate PR 27% of the time at three questions and 41% at five; a tolerable 10% gate-level false-block rate under min would need a 2% per-question false-fail rate, which no free-text judge delivers. Dropping the lowest keeps the intent — you cannot ace two and whiff the one that matters — at roughly 92% under the same noise at five questions.
+
+**The share forgiven is fixed, not the count.** §7 made the question count a function of the diff, and a fixed drop-one rule would have made the gate strictness a function of it too: one of three forgiven is two thirds required, one of six is five sixths. Under the same 10% noise that is a 2.8% false-block rate at three questions and 11.4% at six — the wider band would have silently punished the larger PRs it exists to cover. `n / 3` keeps the requirement at two thirds wherever the band lands (1.6% at six, where the extra evidence earns the extra latitude), and leaves three, four and five questions forgiving exactly one as before.
 
 **Dispute mode.** You claim the question's premise, or the code itself, is wrong.
 

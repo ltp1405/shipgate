@@ -42,23 +42,33 @@ impl std::fmt::Display for Coverage {
     }
 }
 
-/// §8 pass rule: drop-lowest, not min. All but one question at `partial` or
-/// better, and the dropped one no worse than `restates`.
+/// §8 pass rule: drop the lowest `n / 3`, not min. The rest at `partial` or
+/// better, and every dropped one no worse than `restates`.
 ///
 /// Requiring every question ≥ 0.7 (v1) blocks a legitimate PR 27% of the time at
-/// three questions if judging misfires 10% of the time. Drop-lowest keeps the
-/// intent at roughly 92%.
+/// three questions if judging misfires on a good answer 10% of the time.
+///
+/// What has to stay fixed as §7 varies the count is the *share* forgiven, not
+/// the number. Dropping exactly one asks for two thirds of the questions at
+/// n = 3 and five sixths at n = 6, so a fixed drop turns a wider band into a
+/// quietly stricter gate: under the same 10% noise it blocks 2.8% of good PRs
+/// at three questions and 11.4% at six. `n / 3` holds the bar at two thirds
+/// wherever the band lands — 1.6% at six — and leaves the three-question case
+/// exactly as it was.
 pub fn passes(scores: &[f64]) -> bool {
     if scores.is_empty() {
         return true;
     }
-    if scores.len() == 1 {
-        return scores[0] >= 0.6;
-    }
+    let n = scores.len();
+    // One question is the whole gate: there is nothing to drop and still have
+    // asked anything.
+    let drop = if n == 1 { 0 } else { (n / 3).max(1) };
+
     let mut sorted = scores.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let dropped = sorted[0];
-    sorted[1..].iter().all(|s| *s >= 0.6) && dropped >= 0.3
+    // A dropped answer is forgiven, not ignored: `wrong` on any question means
+    // the quiz found something you did not know.
+    sorted[..drop].iter().all(|s| *s >= 0.3) && sorted[drop..].iter().all(|s| *s >= 0.6)
 }
 
 pub struct Ready {
@@ -711,5 +721,40 @@ mod tests {
     #[test]
     fn the_dropped_one_still_has_a_floor() {
         assert!(!passes(&[0.9, 0.9, 0.0]));
+    }
+
+    /// §7 scaled the question count; a fixed drop would have scaled the bar
+    /// with it. Six questions forgive two, which is the same two thirds that
+    /// three questions forgiving one is.
+    #[test]
+    fn the_share_forgiven_holds_as_the_count_grows() {
+        assert!(passes(&[0.9, 0.9, 0.9, 0.9, 0.3, 0.3]));
+        assert!(!passes(&[0.9, 0.9, 0.9, 0.3, 0.3, 0.3]));
+    }
+
+    /// Four and five questions still forgive one: n / 3 only reaches two at
+    /// six, and rounding up would forgive half of a four-question quiz.
+    #[test]
+    fn four_and_five_questions_forgive_exactly_one() {
+        assert!(passes(&[0.9, 0.9, 0.9, 0.3]));
+        assert!(!passes(&[0.9, 0.9, 0.3, 0.3]));
+        assert!(passes(&[0.9, 0.9, 0.9, 0.9, 0.3]));
+        assert!(!passes(&[0.9, 0.9, 0.9, 0.3, 0.3]));
+    }
+
+    /// Forgiven is not ignored. A `wrong` answer means the quiz found something
+    /// you did not know, at any count.
+    #[test]
+    fn a_wrong_answer_blocks_however_many_are_dropped() {
+        assert!(!passes(&[0.9, 0.9, 0.9, 0.9, 0.3, 0.0]));
+    }
+
+    /// The §7 floor is three, but a gate can still hold fewer: an earlier run
+    /// may have left one question, and the rule must not change under it.
+    #[test]
+    fn the_small_cases_are_unchanged() {
+        assert!(passes(&[0.9, 0.3]));
+        assert!(!passes(&[0.9, 0.0]));
+        assert!(!passes(&[0.3, 0.3]));
     }
 }
