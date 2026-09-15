@@ -23,6 +23,9 @@ pub struct Context<'a> {
     pub hunks: &'a [crate::git::Hunk],
     /// Call sites for changed symbols (§6).
     pub call_sites: Vec<String>,
+    /// Added guards with the pre-existing dispatch they now precede (§6).
+    /// `shadowed` questions need it, and nothing else does.
+    pub shadowed: Vec<String>,
     /// Test invocation, if one was found. `checkable` questions need it.
     pub test_command: Option<String>,
     /// What the change claims to be for. Without this the generator can only

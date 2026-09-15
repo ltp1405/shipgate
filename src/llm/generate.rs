@@ -38,6 +38,12 @@ The remaining questions come from, in this order:
   adversarial — 'what input breaks this'.
   cross_cutting — 'what at <this call site> assumes this'. Use ONLY where a call \
     site appears in the context. Never invent a caller.
+  shadowed — 'this guard now runs before the dispatch below it; name something \
+    that used to be handled there and say what happens to it now'. Use ONLY \
+    where a guard appears in the shadowed context, and name a line from the \
+    dispatch quoted under it. The reference answer is read off those lines, not \
+    reasoned about: which of them the guard's condition now prevents reaching. \
+    Never ask this of code the change itself added below the guard.
   justification — 'why this over the obvious alternative'.
 
 Never ask what a function does. Demand a specific value, branch, or call site — \
@@ -78,7 +84,7 @@ const SHAPE: &str = r#"{
   "reason": "",
   "questions": [
     {
-      "kind": "intent | checkable | prediction | adversarial | cross_cutting | justification",
+      "kind": "intent | checkable | prediction | adversarial | cross_cutting | shadowed | justification",
       "file": "path/to/file",
       "anchor": "the anchor string copied verbatim from the hunk",
       "text": "the question",
@@ -162,10 +168,24 @@ impl Generator for CliGenerator {
 
         if ctx.call_sites.is_empty() {
             user.push_str(
-                "# Call sites\n\nNone found. Do not use the cross_cutting kind.\n",
+                "# Call sites\n\nNone found. Do not use the cross_cutting kind.\n\n",
             );
         } else {
-            user.push_str(&format!("# Call sites\n\n{}\n", ctx.call_sites.join("\n")));
+            user.push_str(&format!("# Call sites\n\n{}\n\n", ctx.call_sites.join("\n")));
+        }
+
+        if ctx.shadowed.is_empty() {
+            user.push_str(
+                "# What this change now runs before\n\nNone found. Do not use the \
+                 shadowed kind.\n",
+            );
+        } else {
+            user.push_str(&format!(
+                "# What this change now runs before\n\nEach block is a guard this \
+                 change added, followed by dispatch that was already there and now \
+                 sits behind it.\n\n{}\n",
+                ctx.shadowed.join("\n")
+            ));
         }
 
         let (min, max) = ctx.questions;
@@ -232,6 +252,20 @@ mod tests {
         let p = system_prompt(3, 6);
         assert!(p.contains("between 3 and 6 questions"), "{p}");
         assert!(!p.contains("{min}") && !p.contains("{max}"), "placeholder left in the prompt");
+    }
+
+    /// The kind is useless without its context, and worse than useless with
+    /// invented context — the prompt has to say both.
+    #[test]
+    fn the_prompt_ties_the_shadowed_kind_to_its_context() {
+        let p = system_prompt(3, 6);
+        assert!(p.contains("shadowed"), "the kind is missing from the prompt");
+        assert!(
+            p.contains("Use ONLY \
+    where a guard appears in the shadowed context"),
+            "the kind is not tied to the context that makes it answerable"
+        );
+        assert!(p.contains("| shadowed |"), "the kind is missing from the schema");
     }
 
     #[test]

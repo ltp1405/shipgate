@@ -81,6 +81,24 @@ impl Generator for StubGenerator {
                 ],
             });
         }
+        if !ctx.shadowed.is_empty() {
+            out.push(Generated {
+                kind: "shadowed".into(),
+                file: pick(0).file.clone(),
+                anchor: pick(0).anchor.clone(),
+                text: format!(
+                    "What in {} used to be reached that this change now runs in front of?",
+                    pick(0).file
+                ),
+                reference: "[stand-in] not a real reference answer".into(),
+                hints: vec![
+                    "Read what is below the added guard, not the guard.".into(),
+                    "The dispatch under it was there before.".into(),
+                    "[stand-in] half the answer".into(),
+                ],
+            });
+        }
+
         // The stand-ins answer to the band as well, or --offline would show a
         // quiz shape the real generator cannot produce.
         out.truncate(ctx.questions.1.max(1));

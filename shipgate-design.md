@@ -100,7 +100,7 @@ CREATE UNIQUE INDEX idx_gates_live
 CREATE TABLE questions (
   id          INTEGER PRIMARY KEY,
   gate_id     INTEGER NOT NULL REFERENCES gates(id) ON DELETE CASCADE,
-  kind        TEXT NOT NULL,              -- checkable | prediction | adversarial | cross_cutting | justification
+  kind        TEXT NOT NULL,              -- checkable | prediction | adversarial | cross_cutting | shadowed | justification
   file        TEXT NOT NULL,
   anchor      TEXT NOT NULL,              -- hash of normalized hunk content, NOT a line-number header
   text        TEXT NOT NULL,
@@ -211,10 +211,11 @@ Never hardcode `origin/main`, and never assume the remote is named `origin`.
 
 ## 6. Context gathering
 
-v1 sent the diff alone. Two of its five question kinds are not answerable that way:
+v1 sent the diff alone. Three of the question kinds are not answerable that way:
 
 - **cross_cutting** ("what elsewhere assumes this") — the model cannot know what elsewhere assumes anything. It invents plausible callers and a fabricated reference answer, and a wrong reference plus a correct human answer is a false block.
 - **checkable** ("obtainable by running something") — needs the test command and the fixtures, or the model invents `cargo test sync::retry`, which does not exist.
+- **shadowed** ("what this now runs in front of") — the answer is never in the hunk. What stopped happening is in the unchanged lines below the added guard, which the generator does not otherwise see.
 
 `context.rs` gathers, from static repo state only:
 
@@ -222,7 +223,8 @@ v1 sent the diff alone. Two of its five question kinds are not answerable that w
 
 1. **Call sites.** For each symbol whose signature or semantics changed, `git grep -n` the identifier, with ±3 lines of context. A few hundred tokens; makes `cross_cutting` real.
 2. **Test invocation.** Parsed from `Makefile` / `package.json` / `Cargo.toml` / `justfile` / `bin/rails`, plus the test files touching the changed paths. Makes `checkable` real.
-3. **Before-content** of each changed file under ~200 lines.
+3. **What the change now runs before.** For each added line that stops or diverts flow — `return`, `continue`, `break`, `raise`, `redirect_to` — the unchanged dispatch below it, to the end of the block it sits in. Makes `shadowed` real.
+4. **Before-content** of each changed file under ~200 lines.
 
 None of it is the coding session's transcript. The generator never sees the reasoning that produced the code, so it cannot inherit its mistakes.
 
@@ -248,11 +250,17 @@ Open: the §8 pass rule is count-sensitive. Drop-lowest tolerates one bad judge 
 
 **intent** must relate at least two files or hunks. Shapes that work: what single change of intent required all these files; which of these changes could be dropped and still deliver the goal; what would you expect this to have touched that it deliberately did not; what can a caller do now that they could not before. Never "what does this PR do" or "summarise this change" — those are paraphrase, which this section exists to prevent.
 
-The remaining questions come from, in order: **checkable** (the reviewer obtains the answer by *running* something — only a command actually supplied), **prediction** ("if X were Y, what does the caller at this line observe"), **adversarial** ("what input breaks this"), **cross_cutting** ("what at the given call sites assumes this", only where a call site was supplied), **justification** ("why this over the obvious alternative").
+The remaining questions come from, in order: **checkable** (the reviewer obtains the answer by *running* something — only a command actually supplied), **prediction** ("if X were Y, what does the caller at this line observe"), **adversarial** ("what input breaks this"), **cross_cutting** ("what at the given call sites assumes this", only where a call site was supplied), **shadowed** ("name something the dispatch below this guard used to handle, and say what happens to it now", only where a guard was supplied), **justification** ("why this over the obvious alternative").
 
 Never ask what a function does. Demand a specific value, branch or call site, never "what could go wrong". For each, give a reference answer and three hints of increasing strength. Return JSON only, or `{"skip": true, "reason": "…"}`.
 
 If the generator returns no intent question, the coverage line says so rather than passing quietly.
+
+**`shadowed` asks about the code the change did not touch.** Every other kind is aimed at the lines in front of you: trace this branch, break this input, name this caller. None of them reach the behaviour a change *removes by interposition* — a guard clause, a new match arm, a `before_action`, an early `return` placed above dispatch that was already working. The added lines are correct read on their own; what broke is that something below them stopped being reachable. The question names the guard and asks the reviewer to name a case underneath it and say what became of that case.
+
+Its reference answer is unusually solid for a free-text question: the dispatch lines are quoted in the context, so the reference is read off them — which of these does the guard's condition now prevent reaching — rather than reasoned about. That puts it nearer `checkable` than `prediction` on how often the judge can be wrong about a correct answer.
+
+Like `cross_cutting`, it is skipped where the context is empty, and for the same reason: without the quoted dispatch the model invents a plausible shadow, and a fabricated reference plus a correct human answer is a false block. The detector is deliberately crude — a keyword scan for flow control in the added lines, then the unchanged dispatch below it to the end of its block — and requires two dispatch lines before it reports anything, since one under a guard is as likely to be that guard's own else-branch.
 
 **At least one `checkable` per gate, where a test command exists.** This is the structural defence against the shared blind spot in §8: a question you settle by running `bin/rails runner` or `cargo test` has a ground truth outside the model. Where `context.rs` found no runnable command, or the change has no observable behaviour (pure refactor), the generator may return none — and the gate prints `no checkable` in its coverage line. Requiring one unconditionally would only make the model invent a command, which is the exact failure being defended against.
 
@@ -372,12 +380,13 @@ checkable          22     21       82%      0.4
 prediction         31     19       48%      1.7
 adversarial        24     20       71%      0.9
 cross_cutting      18      9       41%      2.1
+shadowed           11      4       36%      1.4
 justification      14     13       88%      0.3
 
 disputes: 11 raised, 3 upheld (27%)
 ```
 
-The point is the low rows. `prediction` and `cross_cutting` failing consistently is not a scoring artefact — it says which *category* of AI work you routinely accept without understanding: consequences at the call site, and effects on code outside the diff. That is the finding the whole tool exists to produce, and it only appears in aggregate.
+The point is the low rows. `prediction`, `cross_cutting` and `shadowed` failing consistently is not a scoring artefact — it says which *category* of AI work you routinely accept without understanding: consequences at the call site, effects on code outside the diff, and behaviour that a new branch quietly stopped reaching. That is the finding the whole tool exists to produce, and it only appears in aggregate.
 
 Group by `kind` and by month to see movement. `--by-repo` to see whether it is one codebase or all of them.
 

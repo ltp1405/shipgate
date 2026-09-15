@@ -234,6 +234,7 @@ impl Ready {
             diff: &diff,
             hunks: &ai_hunks,
             call_sites: context::call_sites(&dir, &ai_hunks)?,
+            shadowed: context::shadowed(&dir, &ai_hunks)?,
             test_command: context::test_command(&dir),
             pr_title: pr.title.clone(),
             commit_subjects: gh::pr_commits(&dir, pr.number).unwrap_or_default(),
