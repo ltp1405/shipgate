@@ -1,6 +1,6 @@
 //! §7 — questions from the AI-authored hunks plus repo context.
 
-use super::{cli, Context, Generated, Generator};
+use super::{cli, Context, Generated, Generation, Generator};
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
@@ -55,7 +55,9 @@ For each question give a reference answer and three hints of increasing strength
 a nudge, a pointer to specific lines, then half the answer.
 
 If nothing here is worth asking — a version bump, a mechanical rename, a config \
-tweak — set skip to true and give a reason instead of inventing questions.";
+tweak — set skip to true and give a reason instead of inventing questions. The \
+reason must name the file or identifier that makes it not worth asking, since a \
+decline that names nothing in the diff is not a judgement about this change.";
 
 #[derive(Deserialize)]
 struct Output {
@@ -139,7 +141,7 @@ pub fn render_hunks(ctx: &Context) -> String {
 }
 
 impl Generator for CliGenerator {
-    fn generate(&self, ctx: &Context) -> Result<Option<Vec<Generated>>> {
+    fn generate(&self, ctx: &Context) -> Result<Generation> {
         let mut user = String::from("# AI-authored hunks\n\n");
         user.push_str(&render_hunks(ctx));
 
@@ -200,8 +202,7 @@ impl Generator for CliGenerator {
 
         if out.skip || out.questions.is_empty() {
             let reason = if out.reason.is_empty() { "nothing worth asking".into() } else { out.reason };
-            eprintln!("  generator declined: {reason}");
-            return Ok(None);
+            return Ok(Generation::Declined(reason));
         }
 
         // A hallucinated anchor would silently break coverage accounting and
@@ -228,7 +229,7 @@ impl Generator for CliGenerator {
             })
             .collect();
 
-        Ok(Some(questions))
+        Ok(Generation::Questions(questions))
     }
 }
 

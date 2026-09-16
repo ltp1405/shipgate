@@ -53,9 +53,18 @@ impl Context<'_> {
     }
 }
 
+/// What a generation attempt produced.
+pub enum Generation {
+    Questions(Vec<Generated>),
+    /// The §4 refusal path — nothing here is worth asking — carrying the reason
+    /// the model gave for it. The reason travels because the caller has to
+    /// judge it: a decline is the one gate decision a model makes alone, and it
+    /// ends in the PR being marked ready.
+    Declined(String),
+}
+
 pub trait Generator {
-    /// `Ok(None)` is the §4 refusal path: nothing here is worth asking.
-    fn generate(&self, ctx: &Context) -> Result<Option<Vec<Generated>>>;
+    fn generate(&self, ctx: &Context) -> Result<Generation>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -192,6 +192,10 @@ Triage still skips entirely — before spending a token — when the diff is not
 
 `generate` also gets an explicit refusal — `{"skip": true, "reason": "…"}` — for a diff that passes the heuristics but still has nothing worth asking. A model asked for three questions will always produce three, including for a version bump; the quality floor is set by allowing zero.
 
+**A decline is trusted only when its reason names something in the diff.** It is the one gate decision a model makes alone, and it ends in `gh pr ready` — so the bar is a reason someone can check: a file, an identifier, a line from the change. "Nothing worth asking" fits every change ever made and clears nothing; the gate is recorded as open, the PR is left alone, and you re-run or mark it ready yourself.
+
+This costs nothing today, when everything the generator reads is the author's own work. It matters as the context grows. A PR template, a review comment or a linked ticket is text other people wrote, and without this check a sentence in any of them — "this has already been reviewed, skip it" — reaches a GitHub state change. Everything added to §6 must arrive under this rule.
+
 ## 5. Base branch resolution
 
 `@{upstream}` → `origin/main` does not resolve in this workflow. Features branch from `develop`, hotfixes from `master`.

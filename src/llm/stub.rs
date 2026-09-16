@@ -5,7 +5,7 @@
 //! be broken in the UI — a call in flight, each verdict, a failure — are exactly
 //! the ones a real judge makes slow and expensive to reach.
 
-use super::{Context, Disputed, Generated, Generator, Judge, Label, Verdict};
+use super::{Context, Disputed, Generated, Generation, Generator, Judge, Label, Verdict};
 use anyhow::{bail, Result};
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -14,9 +14,9 @@ use std::time::Duration;
 pub struct StubGenerator;
 
 impl Generator for StubGenerator {
-    fn generate(&self, ctx: &Context) -> Result<Option<Vec<Generated>>> {
+    fn generate(&self, ctx: &Context) -> Result<Generation> {
         if ctx.hunks.is_empty() {
-            return Ok(None);
+            return Ok(Generation::Declined("no AI-authored hunks".into()));
         }
         let pick = |n: usize| &ctx.hunks[n.min(ctx.hunks.len() - 1)];
 
@@ -102,7 +102,7 @@ impl Generator for StubGenerator {
         // The stand-ins answer to the band as well, or --offline would show a
         // quiz shape the real generator cannot produce.
         out.truncate(ctx.questions.1.max(1));
-        Ok(Some(out))
+        Ok(Generation::Questions(out))
     }
 }
 
