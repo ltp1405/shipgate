@@ -165,6 +165,19 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE gates ADD COLUMN has_exercise INTEGER NOT NULL DEFAULT 0;
     "#,
+    // 5 — §12. The exercise expects you to leave: it is answered by running the
+    // real program, somewhere other than the quiz screen. Replay already
+    // restores the gate, but the drafts and the hints taken on every *other*
+    // question lived on the app, so a question that sends you away threw them
+    // out. One row per question, written as you type rather than on submit.
+    r#"
+    CREATE TABLE drafts (
+      question_id INTEGER PRIMARY KEY REFERENCES questions(id) ON DELETE CASCADE,
+      answer      TEXT NOT NULL,
+      hints_used  INTEGER NOT NULL DEFAULT 0,
+      updated_at  TEXT NOT NULL
+    );
+    "#,
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -415,6 +428,47 @@ pub fn questions_for(conn: &Connection, gate_id: i64) -> Result<Vec<Question>> {
     let mut stmt = conn.prepare("SELECT * FROM questions WHERE gate_id = ?1 ORDER BY id")?;
     let rows = stmt.query_map(params![gate_id], question_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// A draft, as it stands right now. Written on change rather than on submit,
+/// because the run an `exercise` sends you to is where the terminal gets closed.
+pub fn save_draft(conn: &Connection, question_id: i64, answer: &str, hints_used: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO drafts (question_id, answer, hints_used, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(question_id) DO UPDATE SET
+           answer = excluded.answer,
+           hints_used = excluded.hints_used,
+           updated_at = excluded.updated_at",
+        params![question_id, answer, hints_used, now()],
+    )?;
+    Ok(())
+}
+
+/// The stored drafts for a set of questions, as `(question_id, answer, hints)`.
+pub fn drafts_for(conn: &Connection, question_ids: &[i64]) -> Result<Vec<(i64, String, i64)>> {
+    let mut out = Vec::new();
+    // One statement, reused: a gate has a handful of questions, and building an
+    // `IN (…)` list to save a few round trips would only be a place for the
+    // placeholder count to drift from the parameter count.
+    let mut stmt = conn
+        .prepare("SELECT answer, hints_used FROM drafts WHERE question_id = ?1")?;
+    for id in question_ids {
+        let row = stmt
+            .query_row(params![id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .optional()?;
+        if let Some((answer, hints)) = row {
+            out.push((*id, answer, hints));
+        }
+    }
+    Ok(out)
+}
+
+/// Clear a draft once its answer has been graded: the attempt is the record
+/// from then on, and a draft left behind would be restored over the verdict.
+pub fn clear_draft(conn: &Connection, question_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM drafts WHERE question_id = ?1", params![question_id])?;
+    Ok(())
 }
 
 pub fn record_attempt(
@@ -855,6 +909,41 @@ mod tests {
 
         set_gate_coverage(&conn, gate, 2, true, false).unwrap();
         assert!(!gate_for_pr(&conn, "o/r", 7).unwrap().unwrap().has_exercise);
+    }
+
+    /// §12 — the exercise sends you out of the terminal to answer it, so what
+    /// is typed on the other questions has to outlive the process.
+    #[test]
+    fn a_draft_survives_the_process_and_the_latest_one_wins() {
+        let t = temp_db("drafts");
+        let conn = open_at(&t.0).unwrap();
+        let gate = seed(&conn);
+        insert_questions(
+            &conn,
+            gate,
+            &[NewQuestion {
+                kind: "exercise",
+                file: "a.rs",
+                anchor: "sha256:x",
+                text: "run it",
+                reference: "r",
+                hints: &["one".into()],
+            }],
+        )
+        .unwrap();
+        let q = questions_for(&conn, gate).unwrap().pop().unwrap();
+
+        assert!(drafts_for(&conn, &[q.id]).unwrap().is_empty());
+
+        save_draft(&conn, q.id, "half an obs", 1).unwrap();
+        save_draft(&conn, q.id, "the whole observation", 2).unwrap();
+        let stored = drafts_for(&conn, &[q.id]).unwrap();
+        assert_eq!(stored, vec![(q.id, "the whole observation".to_string(), 2)]);
+
+        // Once graded, the attempt is the record: a draft left behind would be
+        // restored over the verdict on the next run.
+        clear_draft(&conn, q.id).unwrap();
+        assert!(drafts_for(&conn, &[q.id]).unwrap().is_empty());
     }
 
     /// Migration 3 rebuilds the gates table, which drops it while questions and

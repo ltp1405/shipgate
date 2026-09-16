@@ -35,6 +35,13 @@ pub enum AppEvent {
         question_id: i64,
         error: String,
     },
+    /// §8 — the second pass on an `exercise`, comparing what the run printed
+    /// against what the generator predicted it would. It carries no label and
+    /// cannot move the score: reporting what the program did is the job.
+    Diverged {
+        question_id: i64,
+        what: String,
+    },
     /// §8 dispute: the judge's ruling on a claim that the question, its
     /// reference answer or the code is wrong.
     Disputed {
@@ -139,6 +146,21 @@ impl App {
         }
     }
 
+    /// Put back what was typed before the terminal was closed. §12: the
+    /// exercise is answered by running the program, so leaving mid-quiz is a
+    /// normal path rather than a lost run — but only if the drafts survive it.
+    pub fn restore_drafts(&mut self, drafts: &[(i64, String, i64)]) {
+        for (id, answer, hints) in drafts {
+            let Some(i) = self.questions.iter().position(|q| q.id == *id) else {
+                continue;
+            };
+            self.slots[i].answer = answer.clone();
+            // Hints already paid for stay paid for: re-revealing them would
+            // make leaving mid-quiz a way to get them back for free.
+            self.slots[i].hints_shown = (*hints as usize).min(self.questions[i].hints.len());
+        }
+    }
+
     pub fn question(&self) -> Option<&db::Question> {
         self.questions.get(self.current)
     }
@@ -184,6 +206,18 @@ impl App {
         } else {
             Mode::Answering
         }
+    }
+
+    /// An exercise still waiting on the run. It is the one question answered
+    /// away from this screen, so it is the one whose presence makes quitting
+    /// mid-quiz expected rather than a mistake.
+    pub fn exercise_outstanding(&self) -> bool {
+        self.questions
+            .iter()
+            .zip(&self.slots)
+            .any(|(q, slot)| {
+                q.kind == "exercise" && q.status != "passed" && slot.verdict.is_none()
+            })
     }
 
     /// Judge calls still out, grading and disputes alike. The quiz cannot end
@@ -602,7 +636,9 @@ pub fn run(
     questions: Vec<db::Question>,
 ) -> Result<Vec<crate::gate::Scored>> {
     let view = build_diff_view(&diff, ai_hunks);
+    let ids: Vec<i64> = questions.iter().map(|q| q.id).collect();
     let mut app = App::new(questions, view);
+    app.restore_drafts(&db::drafts_for(conn, &ids)?);
     app.jump_to_anchor(ai_hunks);
 
     let (tx, rx): (Sender<AppEvent>, Receiver<AppEvent>) = mpsc::channel();
@@ -685,6 +721,7 @@ fn event_loop(
                         hints_used: app.slots[i].hints_shown,
                     });
                     app.scores[i] = label.score();
+                    let _ = db::clear_draft(conn, question_id);
                     db::record_attempt(
                         conn, question_id, "answer", &graded.answer,
                         graded.hints_used as i64,
@@ -703,6 +740,21 @@ fn event_loop(
                     } else {
                         format!("question {} graded: {}", i + 1, label.as_str())
                     };
+                }
+                AppEvent::Diverged { question_id, what } => {
+                    // Not a failure of the answer: the reviewer reported what
+                    // the program did. It is a failure of the reading that
+                    // produced the prediction, and it settles the way an upheld
+                    // code_bug does — fix it, or withdraw the claim.
+                    db::open_obligation(
+                        conn,
+                        question_id,
+                        &format!("run diverged from the prediction: {what}"),
+                    )?;
+                    if let Some(i) = app.questions.iter().position(|q| q.id == question_id) {
+                        app.slots[i].note = Some(format!("the run diverged: {what}"));
+                    }
+                    app.status = format!("the run diverged from the diff — recorded: {what}");
                 }
                 AppEvent::Failed { question_id, error } => {
                     // Which call failed is what the reviewer needs to know:
@@ -799,6 +851,12 @@ fn event_loop(
             // Quitting with calls outstanding throws away answers that have
             // already been paid for, so it takes a second press.
             (KeyCode::Char('q'), _) => {
+                // §12 — the exercise is answered somewhere other than this
+                // screen, so leaving with one open is a normal path rather than
+                // a lost run. Saying where the drafts went is what makes it one.
+                if app.exercise_outstanding() && app.in_flight() == 0 {
+                    app.status = "drafts kept — `shipgate ready` picks this gate back up".into();
+                }
                 if app.in_flight() > 0 && !app.quit {
                     app.quit = true;
                     app.status = format!(
@@ -890,6 +948,7 @@ fn event_loop(
                     Some(slot) if shown < available => slot.hints_shown += 1,
                     _ => app.status = "no more hints".into(),
                 }
+                save_draft(conn, app);
             }
 
             (KeyCode::Char('a'), _) | (KeyCode::Char('e'), _) => {
@@ -907,6 +966,7 @@ fn event_loop(
                         slot.verdict = None;
                     }
                 }
+                save_draft(conn, app);
                 if !empty {
                     app.status = STATUS_ANSWERED.into();
                 }
@@ -938,6 +998,33 @@ fn event_loop(
 
             _ => {}
         }
+    }
+}
+
+/// The command an `exercise` tells you to run, pulled out of its text so the
+/// pane can show it on a line of its own and it can be copied out without
+/// retyping. The generator is told to name it verbatim in backticks; anything
+/// else is not offered rather than guessed at.
+pub fn invocation(q: &db::Question) -> Option<&str> {
+    if q.kind != "exercise" {
+        return None;
+    }
+    let (_, rest) = q.text.split_once('`')?;
+    let (cmd, _) = rest.split_once('`')?;
+    (!cmd.trim().is_empty()).then_some(cmd)
+}
+
+/// Persist the current question's draft. §12 — written on change rather than on
+/// submit, because the exercise sends you out of the terminal to answer it and
+/// what is typed on the *other* questions has to survive that.
+///
+/// A failed write is a note, not an error: losing the quiz over a draft would
+/// cost more than the draft does.
+fn save_draft(conn: &Connection, app: &mut App) {
+    let Some(q) = app.question() else { return };
+    let (id, answer, hints) = (q.id, app.answer().to_string(), app.hints_shown() as i64);
+    if let Err(e) = db::save_draft(conn, id, &answer, hints) {
+        app.status = format!("draft not saved: {e}");
     }
 }
 
@@ -1116,6 +1203,8 @@ fn submit(
     let tx = tx.clone();
     let answer = app.answer().to_string();
     let text = q.text.clone();
+    let reference = q.reference.clone();
+    let is_exercise = q.kind == "exercise";
     let id = q.id;
     let judge = Arc::clone(judge);
     let diff = Arc::clone(diff);
@@ -1125,11 +1214,31 @@ fn submit(
     // whole arrangement exists to avoid.
     std::thread::spawn(move || {
         let ev = match judge.judge(&diff, &text, &answer) {
-            Ok(v) => AppEvent::Graded {
-                question_id: id,
-                label: v.label,
-                feedback: v.feedback,
-            },
+            Ok(v) => {
+                // §8 — an exercise is graded twice. The second pass runs here,
+                // before the verdict is sent, so that `pending` is still set
+                // while it is outstanding: the quiz cannot end on a verdict
+                // whose divergence has not been recorded yet.
+                if is_exercise && v.label.score() > 0.0 {
+                    match judge.divergence(&text, &reference, &answer) {
+                        Ok(d) if d.diverged => {
+                            let _ = tx.send(AppEvent::Diverged {
+                                question_id: id,
+                                what: d.what,
+                            });
+                        }
+                        Ok(_) => {}
+                        // The label is already decided; losing it over the pass
+                        // that cannot change it would be the wrong trade.
+                        Err(e) => eprintln!("the divergence check failed: {e}"),
+                    }
+                }
+                AppEvent::Graded {
+                    question_id: id,
+                    label: v.label,
+                    feedback: v.feedback,
+                }
+            }
             Err(e) => AppEvent::Failed {
                 question_id: id,
                 error: e.to_string(),
@@ -1225,6 +1334,10 @@ pub fn run_headless(
     }
 
     let mut app = App::new(questions, build_diff_view(&diff, ai_hunks));
+    // The headless loop restores drafts for the same reason the real one does:
+    // a test that cannot see them restored cannot prove they were kept.
+    let ids: Vec<i64> = app.questions.iter().map(|q| q.id).collect();
+    app.restore_drafts(&db::drafts_for(conn, &ids)?);
     app.current = 0;
     app.scores = vec![0.0; app.questions.len()];
     app.status = String::new();
@@ -1414,6 +1527,201 @@ diff --git a/sync.rs b/sync.rs
         event::KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// A gate with one exercise, and a judge that reports a divergence on it.
+    fn exercise_fixture(
+        n: usize,
+    ) -> (rusqlite::Connection, Vec<git::Hunk>, Vec<db::Question>) {
+        let (conn, hunks, _) = fixture(n);
+        let gate = db::gate_for_pr(&conn, "o/r", 1).unwrap().unwrap().id;
+        db::insert_questions(
+            &conn,
+            gate,
+            &[db::NewQuestion {
+                kind: "exercise",
+                file: "sync.rs",
+                anchor: &hunks[0].anchor,
+                text: "Run `shipgate ready` and report what the status line says.",
+                reference: "the status line reports the question was graded",
+                hints: &[],
+            }],
+        )
+        .unwrap();
+        let questions = db::questions_for(&conn, gate).unwrap();
+        (conn, hunks, questions)
+    }
+
+    /// A judge that grades like the stub and always reports a divergence.
+    struct DivergingJudge;
+
+    impl llm::Judge for DivergingJudge {
+        fn judge(&self, _d: &str, _q: &str, _a: &str) -> Result<llm::Verdict> {
+            Ok(llm::Verdict {
+                label: llm::Label::Demonstrates,
+                feedback: "[test] accepted".into(),
+            })
+        }
+
+        fn divergence(&self, _q: &str, _p: &str, _o: &str) -> Result<llm::Divergence> {
+            Ok(llm::Divergence {
+                diverged: true,
+                what: "the status line stayed empty".into(),
+            })
+        }
+
+        fn dispute(&self, _q: &str, _r: &str, _c: &str) -> Result<llm::Disputed> {
+            unreachable!("this test never disputes")
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// §12 — the exercise is answered by running the program, so leaving the
+    /// quiz is a normal path. What was typed on the other questions has to be
+    /// there when you come back.
+    #[test]
+    fn a_draft_is_written_as_it_is_typed_and_restored_on_the_next_run() {
+        let (conn, hunks, questions) = fixture(1);
+        let ids: Vec<i64> = questions.iter().map(|q| q.id).collect();
+
+        // Write an answer, take a hint, then leave without submitting.
+        run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::scripted([])),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions.clone(),
+            vec![key('a'), key('q')],
+            true,
+        )
+        .unwrap();
+
+        let stored = db::drafts_for(&conn, &ids).unwrap();
+        assert_eq!(stored.len(), 1, "the draft was not written");
+        assert!(!stored[0].1.is_empty());
+
+        // Coming back to the same gate: the draft is on the slot, unsubmitted.
+        let app = run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::scripted([])),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('q')],
+            true,
+        )
+        .unwrap();
+        assert_eq!(app.slots[0].answer, stored[0].1, "the draft was not restored");
+    }
+
+    /// Hints already paid for stay paid for — leaving mid-quiz is not a way to
+    /// get them back.
+    #[test]
+    fn a_taken_hint_is_restored_with_the_draft() {
+        let (conn, hunks, questions) = fixture(1);
+        // The fixture's question has no hints, so restoring has to clamp rather
+        // than report a hint that does not exist.
+        db::save_draft(&conn, questions[0].id, "an answer", 3).unwrap();
+
+        let app = run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::scripted([])),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('q')],
+            true,
+        )
+        .unwrap();
+        assert_eq!(app.slots[0].answer, "an answer");
+        assert_eq!(app.slots[0].hints_shown, 0, "a hint that does not exist was restored");
+    }
+
+    /// Once the answer is graded the attempt is the record. A draft left behind
+    /// would be restored over the verdict on the next run.
+    #[test]
+    fn a_graded_answer_leaves_no_draft_behind() {
+        let (conn, hunks, questions) = fixture(1);
+        let ids: Vec<i64> = questions.iter().map(|q| q.id).collect();
+        run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::scripted([Some(llm::Label::Demonstrates)])),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('a'), ctrl('s'), key('q')],
+            true,
+        )
+        .unwrap();
+        assert!(db::drafts_for(&conn, &ids).unwrap().is_empty());
+    }
+
+    /// §12 — quitting with an exercise open is expected, not a lost run, and
+    /// the way to say so is to say where the drafts went.
+    #[test]
+    fn quitting_with_an_exercise_open_says_the_drafts_are_kept() {
+        let (conn, hunks, questions) = exercise_fixture(1);
+        let app = run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::scripted([])),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('q')],
+            true,
+        )
+        .unwrap();
+        assert!(app.status.contains("drafts kept"), "status: {}", app.status);
+    }
+
+    /// The same quit with nothing to run keeps the ordinary status line: a gate
+    /// with no exercise has nothing to leave the terminal for.
+    #[test]
+    fn quitting_an_ordinary_quiz_says_nothing_about_drafts() {
+        let app = drive(1, llm::stub::StubJudge::scripted([]), vec![key('q')]);
+        assert!(!app.status.contains("drafts kept"), "status: {}", app.status);
+    }
+
+    /// §8 — the divergence is the finding the tool exists to produce: the diff
+    /// read correct and the program did not agree. It is recorded as an
+    /// obligation rather than as a failed answer.
+    #[test]
+    fn a_diverging_exercise_opens_an_obligation_without_moving_the_score() {
+        let (conn, hunks, questions) = exercise_fixture(1);
+        let exercise = questions.iter().position(|q| q.kind == "exercise").unwrap();
+
+        let app = run_headless(
+            &conn,
+            Arc::new(DivergingJudge),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            // Straight to the exercise, answer it, submit.
+            vec![
+                key(char::from_digit(exercise as u32 + 1, 10).unwrap()),
+                key('a'),
+                ctrl('s'),
+                key('q'),
+            ],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(app.scores[exercise], 0.9, "the divergence moved the score");
+        assert!(
+            app.slots[exercise]
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("the status line stayed empty")),
+            "the divergence is not on the question: {:?}",
+            app.slots[exercise].note
+        );
+        let obligations = db::open_obligations(&conn, "o/r").unwrap();
+        assert_eq!(obligations.len(), 1, "no obligation was opened");
+        assert!(obligations[0].body.contains("the status line stayed empty"));
+    }
+
     /// A swallowed quit used to leave the headless loop spinning on synthetic
     /// `q` keys, burning a core and growing the query string until someone
     /// noticed the machine. It has to fail instead.
@@ -1517,6 +1825,7 @@ diff --git a/sync.rs b/sync.rs
             AppEvent::Graded { label, .. } => assert_eq!(label, Label::Wrong),
             AppEvent::Failed { error, .. } => panic!("reached the judge: {error}"),
             AppEvent::Disputed { .. } => panic!("a submit produced a dispute ruling"),
+            AppEvent::Diverged { .. } => panic!("the precheck path ran a divergence pass"),
         }
         drop(conn);
     }

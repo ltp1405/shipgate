@@ -189,6 +189,17 @@ fn render_question(f: &mut Frame, app: &App, area: Rect) {
         Style::default().add_modifier(Modifier::BOLD),
     )));
 
+    // §12 — an exercise is an instruction, not a question, and the command it
+    // names has to be copyable off the screen rather than retyped from inside a
+    // paragraph.
+    if let Some(cmd) = super::invocation(q) {
+        top.push(Line::from(""));
+        top.push(Line::from(Span::styled(
+            format!("$ {cmd}"),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+    }
+
     for hint in q.hints.iter().take(app.hints_shown()) {
         top.push(Line::from(""));
         top.push(Line::from(Span::styled(
@@ -244,20 +255,27 @@ fn render_question(f: &mut Frame, app: &App, area: Rect) {
         rows[0],
     );
 
+    // What the buffer is called depends on what was asked for. An exercise is
+    // answered by reporting what the program printed, and calling that "your
+    // answer" invites a paragraph of reasoning instead of the observation.
+    let is_exercise = super::invocation(q).is_some() || q.kind == "exercise";
+    let (empty_prompt, box_title) = if is_exercise {
+        ("press a to paste what the run printed", " your observation ")
+    } else {
+        ("press a to write your answer in $EDITOR", " your answer ")
+    };
+
     let (body, style) = if app.mode() == Mode::Grading {
         ("grading…".to_string(), Style::default().fg(Color::Yellow))
     } else if app.answer().is_empty() {
-        (
-            "press a to write your answer in $EDITOR".to_string(),
-            Style::default().fg(Color::DarkGray),
-        )
+        (empty_prompt.to_string(), Style::default().fg(Color::DarkGray))
     } else {
         (app.answer().to_string(), Style::default())
     };
 
     f.render_widget(
         Paragraph::new(Span::styled(body, style))
-            .block(Block::default().borders(Borders::ALL).title(" your answer "))
+            .block(Block::default().borders(Borders::ALL).title(box_title))
             .wrap(Wrap { trim: false }),
         rows[1],
     );
@@ -323,6 +341,46 @@ pub(crate) mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// An exercise: an instruction naming the command in backticks, the way the
+    /// generator is told to write it.
+    fn exercise_app() -> App {
+        let mut app = app();
+        app.questions[0].kind = "exercise".into();
+        app.questions[0].text =
+            "Run `shipgate ready --offline` on this branch and report what the \
+             status line says."
+                .into();
+        app
+    }
+
+    /// §12 — the command has to come off the screen without being retyped out
+    /// of the middle of a paragraph.
+    #[test]
+    fn an_exercise_shows_its_invocation_on_a_line_of_its_own() {
+        let buf = draw(&exercise_app(), W, H);
+        assert!(
+            contains(&buf, "$ shipgate ready --offline"),
+            "the invocation is not on its own line:\n{}",
+            rows(&buf).join("\n")
+        );
+    }
+
+    /// The answer to an exercise is a report of what happened, and a box
+    /// labelled "your answer" invites a paragraph of reasoning instead.
+    #[test]
+    fn the_exercise_answer_box_asks_for_an_observation() {
+        let buf = draw(&exercise_app(), W, H);
+        assert!(contains(&buf, "your observation"), "{}", rows(&buf).join("\n"));
+        assert!(contains(&buf, "paste what the run printed"));
+    }
+
+    #[test]
+    fn an_ordinary_question_shows_no_invocation_line() {
+        let buf = draw(&app(), W, H);
+        assert!(!contains(&buf, "$ "), "{}", rows(&buf).join("\n"));
+        assert!(contains(&buf, "your answer"));
     }
 
     fn contains(buf: &Buffer, needle: &str) -> bool {
