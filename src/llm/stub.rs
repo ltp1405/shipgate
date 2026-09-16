@@ -5,7 +5,9 @@
 //! be broken in the UI — a call in flight, each verdict, a failure — are exactly
 //! the ones a real judge makes slow and expensive to reach.
 
-use super::{Context, Disputed, Generated, Generation, Generator, Judge, Label, Verdict};
+use super::{
+    Context, Disputed, Divergence, Generated, Generation, Generator, Judge, Label, Verdict,
+};
 use anyhow::{bail, Result};
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -77,6 +79,26 @@ impl Generator for StubGenerator {
                 hints: vec![
                     "Run it and read the output.".into(),
                     format!("`{cmd}` covers the changed paths."),
+                    "[stand-in] half the answer".into(),
+                ],
+            });
+        }
+        // Both halves or nothing: a stand-in that invents a way to run the
+        // program would show a quiz shape the real generator refuses to produce.
+        if let (Some(cmd), false) = (&ctx.run_invocation, ctx.surfaces.is_empty()) {
+            out.push(Generated {
+                kind: "exercise".into(),
+                file: pick(0).file.clone(),
+                anchor: pick(0).anchor.clone(),
+                text: format!(
+                    "Run `{cmd}`. Reach the change in {} through the surface it sits \
+                     behind, and report what happened.",
+                    pick(0).file
+                ),
+                reference: "[stand-in] not a real prediction of the run".into(),
+                hints: vec![
+                    "Start the program, not the suite.".into(),
+                    "The surfaces are listed in the context.".into(),
                     "[stand-in] half the answer".into(),
                 ],
             });
@@ -191,6 +213,20 @@ impl Judge for StubJudge {
                 feedback: "[offline] too short to be a real answer.".into(),
             }),
         }
+    }
+
+    /// Never diverges. A stand-in that invented one would open an obligation
+    /// against a run that never happened.
+    fn divergence(
+        &self,
+        _question: &str,
+        _prediction: &str,
+        _observation: &str,
+    ) -> Result<Divergence> {
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        Ok(Divergence { diverged: false, what: String::new() })
     }
 
     fn dispute(&self, _question: &str, _reference: &str, _claim: &str) -> Result<Disputed> {

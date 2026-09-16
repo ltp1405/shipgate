@@ -281,6 +281,181 @@ pub fn test_command(dir: &Path) -> Option<String> {
     None
 }
 
+/// How the real program is started, as a user starts it. `exercise` questions
+/// need it: without one the model invents a way to run the thing, and a
+/// fabricated invocation costs minutes before it is found to be nonsense.
+///
+/// Deliberately not `test_command`. A test command is the thing that gets run
+/// *instead of* the program, which is the habit the kind exists to break.
+pub fn run_invocation(dir: &Path) -> Option<String> {
+    let has = |p: &str| dir.join(p).exists();
+    let read = |p: &str| std::fs::read_to_string(dir.join(p)).ok();
+
+    if has("package.json") {
+        if let Some(pkg) = read("package.json") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
+                let scripts = v.get("scripts");
+                for name in ["dev", "start"] {
+                    if scripts.and_then(|s| s.get(name)).is_some() {
+                        return Some(format!("npm run {name}"));
+                    }
+                }
+            }
+        }
+    }
+    if has("bin/dev") {
+        return Some("bin/dev".into());
+    }
+    if let Some(proc) = read("Procfile") {
+        // `web: bin/rails server` — the process is what starts the program;
+        // the label is Procfile's, not the shell's.
+        if let Some(line) = proc.lines().find(|l| l.contains(':') && !l.trim().is_empty()) {
+            if let Some((_, cmd)) = line.split_once(':') {
+                let cmd = cmd.trim();
+                if !cmd.is_empty() {
+                    return Some(cmd.to_string());
+                }
+            }
+        }
+    }
+    if let Some(just) = read("justfile") {
+        for target in ["run", "dev", "serve"] {
+            if just.lines().any(|l| l.starts_with(&format!("{target}:"))) {
+                return Some(format!("just {target}"));
+            }
+        }
+    }
+    if let Some(cargo) = read("Cargo.toml") {
+        if let Some(name) = cargo_bin_name(&cargo) {
+            return Some(format!("cargo run --bin {name}"));
+        }
+    }
+    read("README.md").as_deref().and_then(readme_usage)
+}
+
+/// The `name` of the first `[[bin]]`, or the package name where the crate has
+/// no explicit one — a `src/main.rs` binary is named after its package.
+fn cargo_bin_name(cargo: &str) -> Option<String> {
+    let value = |line: &str| {
+        line.split_once('=')
+            .map(|(_, v)| v.trim().trim_matches('"').to_string())
+            .filter(|v| !v.is_empty())
+    };
+
+    let mut section = "";
+    let mut package_name = None;
+    for line in cargo.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            section = if t == "[[bin]]" {
+                "bin"
+            } else if t == "[package]" {
+                "package"
+            } else {
+                ""
+            };
+            continue;
+        }
+        if !t.starts_with("name") {
+            continue;
+        }
+        match section {
+            "bin" => return value(t),
+            "package" => package_name = value(t),
+            _ => {}
+        }
+    }
+    package_name
+}
+
+/// The first shell block under a README heading that reads like usage. A
+/// heading match is required: the first fenced block in a README is as often
+/// an install line or an example of the library's API.
+fn readme_usage(readme: &str) -> Option<String> {
+    const HEADINGS: &[&str] = &["usage", "running", "run", "getting started", "quick start"];
+
+    let mut under_usage = false;
+    let mut in_block = false;
+    for line in readme.lines() {
+        let t = line.trim();
+        if let Some(title) = t.strip_prefix('#') {
+            let title = title.trim_start_matches('#').trim().to_lowercase();
+            under_usage = HEADINGS.iter().any(|h| title == *h || title.starts_with(h));
+            in_block = false;
+            continue;
+        }
+        if t.starts_with("```") {
+            // A block opening under the heading is the one to read; anything
+            // after it closes has left the section the heading vouched for.
+            if in_block {
+                under_usage = false;
+            }
+            in_block = !in_block;
+            continue;
+        }
+        if under_usage && in_block {
+            let cmd = t.trim_start_matches('$').trim();
+            if !cmd.is_empty() && !cmd.starts_with('#') {
+                return Some(cmd.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Where a changed symbol is reachable from: the route that dispatches to it,
+/// the subcommand that reaches it, the key handler that fires it.
+///
+/// Paired with `run_invocation`, this is what makes an `exercise` real — the
+/// invocation starts the program and the surface says where to look once it is
+/// running. Either one alone is not enough, so the kind is skipped without
+/// both. Migration-only and pure-internals changes legitimately have neither.
+pub fn surfaces(dir: &Path, hunks: &[git::Hunk]) -> Result<Vec<String>> {
+    // Word-boundary matched for the reason the `shadowed` keywords are: a
+    // substring scan makes `route` out of `reroute` and `get` out of `target`.
+    const MARKERS: &[&str] = &[
+        "route", "routes", "get", "post", "put", "patch", "delete", "resources", "namespace",
+        "scope", "Router", "Route", "path", "url", "endpoint", "handler", "Subcommand",
+        "subcommand", "command", "Command", "KeyCode", "on_key", "addEventListener", "listen",
+        "bind", "mount", "register", "dispatch", "menu", "before_action",
+    ];
+
+    let mut out = Vec::new();
+    for symbol in changed_symbols(hunks) {
+        // Unlike `call_sites`, the changed files are not excluded: a route the
+        // change itself added is still the surface it sits behind.
+        let hits = git::grep_symbol(dir, &symbol, &HashSet::new())?;
+        let dispatches: Vec<String> = hits
+            .into_iter()
+            .filter(|line| !defines(line, &symbol) && has_marker(line, MARKERS))
+            .take(4)
+            .collect();
+        if dispatches.is_empty() {
+            continue;
+        }
+        out.push(format!("# `{symbol}` is reachable through"));
+        out.extend(dispatches);
+    }
+    out.truncate(40);
+    Ok(out)
+}
+
+/// A line that declares the symbol is where it lives, not a way to reach it.
+fn defines(line: &str, symbol: &str) -> bool {
+    const DEFINERS: &[&str] = &[
+        "fn ", "def ", "class ", "func ", "struct ", "enum ", "trait ", "impl ", "const ",
+        "type ", "interface ", "module ",
+    ];
+    DEFINERS.iter().any(|kw| line.contains(&format!("{kw}{symbol}")))
+}
+
+fn has_marker(line: &str, markers: &[&str]) -> bool {
+    // The `file:line:` prefix `git grep -n` writes is not part of the code, and
+    // a path like `src/routes/mod.rs` would otherwise vouch for every hit in it.
+    let code = line.splitn(3, ':').nth(2).unwrap_or(line);
+    markers.iter().any(|m| has_word(code, m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,5 +691,175 @@ fn existing(x: u8) {
         let h = hunks("+fn alpha() {}\n+fn alpha() {}\n");
         assert_eq!(changed_symbols(&h).len(), 1);
     }
+
+    fn write(dir: &tempdir::Dir, path: &str, body: &str) {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    /// A repository, because `surfaces` reads the tree through `git grep`.
+    fn repo() -> tempdir::Dir {
+        let dir = tempdir::Dir::new();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+        }
+        dir
+    }
+
+    fn commit(dir: &tempdir::Dir) {
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "x"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_dev_script_is_how_the_program_starts() {
+        let dir = tempdir::Dir::new();
+        write(&dir, "package.json", r#"{"scripts": {"dev": "vite", "test": "vitest"}}"#);
+        assert_eq!(run_invocation(dir.path()).as_deref(), Some("npm run dev"));
+    }
+
+    /// The test command is the thing that gets run *instead of* the program, so
+    /// a project with only a test script has no run invocation at all.
+    #[test]
+    fn a_test_script_alone_is_not_a_run_invocation() {
+        let dir = tempdir::Dir::new();
+        write(&dir, "package.json", r#"{"scripts": {"test": "vitest"}}"#);
+        assert_eq!(run_invocation(dir.path()), None);
+    }
+
+    #[test]
+    fn a_procfile_process_starts_the_program() {
+        let dir = tempdir::Dir::new();
+        write(&dir, "Procfile", "web: bin/rails server -p 3000\nworker: bundle exec sidekiq\n");
+        assert_eq!(run_invocation(dir.path()).as_deref(), Some("bin/rails server -p 3000"));
+    }
+
+    #[test]
+    fn a_justfile_run_target_starts_the_program() {
+        let dir = tempdir::Dir::new();
+        write(&dir, "justfile", "test:\n    cargo test\nserve:\n    cargo run\n");
+        assert_eq!(run_invocation(dir.path()).as_deref(), Some("just serve"));
+    }
+
+    #[test]
+    fn a_crate_runs_by_its_binary_name() {
+        let dir = tempdir::Dir::new();
+        write(&dir, "Cargo.toml", "[package]\nname = \"shipgate\"\nversion = \"0.1.0\"\n");
+        assert_eq!(run_invocation(dir.path()).as_deref(), Some("cargo run --bin shipgate"));
+    }
+
+    #[test]
+    fn an_explicit_bin_name_wins_over_the_package_name() {
+        let dir = tempdir::Dir::new();
+        write(
+            &dir,
+            "Cargo.toml",
+            "[package]\nname = \"the-crate\"\n\n[[bin]]\nname = \"the-tool\"\npath = \"src/main.rs\"\n",
+        );
+        assert_eq!(run_invocation(dir.path()).as_deref(), Some("cargo run --bin the-tool"));
+    }
+
+    #[test]
+    fn a_readme_usage_block_is_the_last_resort() {
+        let dir = tempdir::Dir::new();
+        write(&dir, "README.md", "# Thing\n\nWhat it is.\n\n## Usage\n\n```\n$ thing serve --port 8080\n```\n");
+        assert_eq!(run_invocation(dir.path()).as_deref(), Some("thing serve --port 8080"));
+    }
+
+    /// The first fenced block in a README is as often an install line as a way
+    /// to run the thing, so a heading has to vouch for it.
+    #[test]
+    fn a_readme_block_under_no_usage_heading_is_not_taken() {
+        let dir = tempdir::Dir::new();
+        write(&dir, "README.md", "# Thing\n\n## Install\n\n```\ncargo install thing\n```\n");
+        assert_eq!(run_invocation(dir.path()), None);
+    }
+
+    #[test]
+    fn a_repo_with_nothing_runnable_has_no_invocation() {
+        let dir = tempdir::Dir::new();
+        write(&dir, "notes.txt", "nothing here");
+        assert_eq!(run_invocation(dir.path()), None);
+    }
+
+    #[test]
+    fn the_route_that_dispatches_to_a_changed_symbol_is_a_surface() {
+        let dir = repo();
+        write(&dir, "src/handlers.rs", "pub fn refund_order() {}\n");
+        write(&dir, "src/router.rs", "    router.route(\"/refunds\", post(refund_order));\n");
+        commit(&dir);
+
+        let h = git::parse_diff(
+            "diff --git a/src/handlers.rs b/src/handlers.rs\n@@ -1,1 +1,2 @@\n+pub fn refund_order() {}\n",
+        );
+        let out = surfaces(dir.path(), &h).unwrap().join("\n");
+        assert!(out.contains("refund_order"), "the symbol is missing: {out}");
+        assert!(out.contains("src/router.rs"), "the route is missing: {out}");
+    }
+
+    /// The definition is where the symbol lives, not a way to reach it. A
+    /// surface list that offers it sends the reviewer back to the diff.
+    #[test]
+    fn the_definition_is_not_offered_as_a_surface() {
+        let dir = repo();
+        write(&dir, "src/commands.rs", "pub fn run_command(path: &str) {}\n");
+        commit(&dir);
+
+        let h = git::parse_diff(
+            "diff --git a/src/commands.rs b/src/commands.rs\n@@ -1,1 +1,2 @@\n+pub fn run_command(path: &str) {}\n",
+        );
+        assert!(surfaces(dir.path(), &h).unwrap().is_empty());
+    }
+
+    /// Pure internals have no surface, and saying so is the point: the kind is
+    /// skipped rather than invented.
+    #[test]
+    fn a_symbol_nothing_dispatches_to_has_no_surface() {
+        let dir = repo();
+        write(&dir, "src/math.rs", "pub fn normalise_ratio(n: f64) -> f64 { n }\n");
+        write(&dir, "src/other.rs", "    let x = normalise_ratio(2.0);\n");
+        commit(&dir);
+
+        let h = git::parse_diff(
+            "diff --git a/src/math.rs b/src/math.rs\n@@ -1,1 +1,2 @@\n+pub fn normalise_ratio(n: f64) -> f64 { n }\n",
+        );
+        assert!(surfaces(dir.path(), &h).unwrap().is_empty());
+    }
+
+    /// A path like `src/routes/mod.rs` would otherwise vouch for every hit in
+    /// the file, since `git grep -n` writes it in front of every line.
+    #[test]
+    fn a_marker_in_the_path_does_not_make_a_surface() {
+        let dir = repo();
+        write(&dir, "src/routes/calc.rs", "pub fn compute_total() {}\n");
+        write(&dir, "src/routes/helpers.rs", "    let t = compute_total();\n");
+        commit(&dir);
+
+        let h = git::parse_diff(
+            "diff --git a/src/routes/calc.rs b/src/routes/calc.rs\n@@ -1,1 +1,2 @@\n+pub fn compute_total() {}\n",
+        );
+        assert!(surfaces(dir.path(), &h).unwrap().is_empty());
+    }
+
+    #[test]
+    fn surface_markers_match_on_word_boundaries() {
+        assert!(has_marker("a.rs:3:    router.get(\"/x\", h);", &["get"]));
+        assert!(!has_marker("a.rs:3:    let t = target();", &["get"]));
+    }
+
 }
 

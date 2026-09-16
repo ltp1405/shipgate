@@ -157,6 +157,14 @@ const MIGRATIONS: &[&str] = &[
       ON gates(repo, pr_number) WHERE superseded_at IS NULL;
     CREATE INDEX idx_gates_pr ON gates(repo, pr_number);
     "#,
+    // 4 — §7's exercise kind. A gate that could not have one because the
+    // repository offered no way to run the program is a different fact from a
+    // gate that skipped it, and `stats` reports the share of work that shipped
+    // with nothing but the suite watching it. Neither is recoverable from the
+    // questions alone, so the gate records it.
+    r#"
+    ALTER TABLE gates ADD COLUMN has_exercise INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -233,6 +241,7 @@ pub struct Gate {
     pub hunks_covered: i64,
     pub authorship: String,
     pub has_checkable: bool,
+    pub has_exercise: bool,
     pub state: String,
 }
 
@@ -333,10 +342,12 @@ pub fn set_gate_coverage(
     gate_id: i64,
     covered: i64,
     has_checkable: bool,
+    has_exercise: bool,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE gates SET hunks_covered = ?1, has_checkable = ?2, updated_at = ?3 WHERE id = ?4",
-        params![covered, has_checkable as i64, now(), gate_id],
+        "UPDATE gates SET hunks_covered = ?1, has_checkable = ?2, has_exercise = ?3, \
+         updated_at = ?4 WHERE id = ?5",
+        params![covered, has_checkable as i64, has_exercise as i64, now(), gate_id],
     )?;
     Ok(())
 }
@@ -472,6 +483,7 @@ fn gate_from_row(row: &rusqlite::Row) -> rusqlite::Result<Gate> {
         hunks_covered: row.get("hunks_covered")?,
         authorship: row.get("authorship")?,
         has_checkable: row.get::<_, i64>("has_checkable")? != 0,
+        has_exercise: row.get::<_, i64>("has_exercise")? != 0,
         state: row.get("state")?,
     })
 }
@@ -823,6 +835,26 @@ mod tests {
             .query_row("SELECT count(*) FROM gates WHERE id = ?1", params![gate], |r| r.get(0))
             .unwrap();
         assert_eq!(kept, 1, "the closed PR's gate was deleted");
+    }
+
+    /// A gate that could not have an exercise — nothing in the repository says
+    /// how to run the program — is a different fact from one that skipped it,
+    /// and §11 reports the difference. It has to survive the round trip.
+    #[test]
+    fn coverage_records_whether_the_gate_had_an_exercise() {
+        let t = temp_db("exercise-coverage");
+        let conn = open_at(&t.0).unwrap();
+        let gate = seed(&conn);
+
+        assert!(!gate_for_pr(&conn, "o/r", 7).unwrap().unwrap().has_exercise);
+
+        set_gate_coverage(&conn, gate, 2, true, true).unwrap();
+        let stored = gate_for_pr(&conn, "o/r", 7).unwrap().unwrap();
+        assert!(stored.has_exercise);
+        assert!(stored.has_checkable);
+
+        set_gate_coverage(&conn, gate, 2, true, false).unwrap();
+        assert!(!gate_for_pr(&conn, "o/r", 7).unwrap().unwrap().has_exercise);
     }
 
     /// Migration 3 rebuilds the gates table, which drops it while questions and

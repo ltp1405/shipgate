@@ -1,6 +1,6 @@
 //! §8 — grading. The reference answer is deliberately absent from this context.
 
-use super::{cli, Disputed, Judge, Label, Verdict};
+use super::{cli, Disputed, Divergence, Judge, Label, Verdict};
 use anyhow::Result;
 use serde::Deserialize;
 
@@ -57,6 +57,37 @@ kind:
   premise   — the question assumes something the code does not do.
   reference — the question is fair but the stored answer is wrong.
   code_bug  — the code itself is wrong, and the reviewer has identified it.";
+
+const DIVERGENCE_SYSTEM: &str = "\
+An `exercise` asked the reviewer to run the real program and report what \
+happened. You are given what a careful reader of the diff PREDICTED the run \
+would print, and what the reviewer reports it actually printed.
+
+Say only whether the two diverge on something that matters: a different value, a \
+different branch taken, an error where none was predicted, nothing happening \
+where something was predicted. Wording, formatting and detail the prediction \
+did not mention are not divergences.
+
+You are not grading the reviewer. The observation is evidence and the prediction \
+is the claim being tested — if they disagree, the prediction is what was wrong, \
+and `what` states the disagreement in one sentence.";
+
+#[derive(Deserialize)]
+struct DivergenceReply {
+    #[allow(dead_code)]
+    #[serde(default)]
+    reasoning: String,
+    #[serde(default)]
+    diverged: bool,
+    #[serde(default)]
+    what: String,
+}
+
+const DIVERGENCE_SHAPE: &str = r#"{
+  "reasoning": "what the prediction claims, and what the observation shows",
+  "diverged": false,
+  "what": "one sentence naming the disagreement, or an empty string"
+}"#;
 
 #[derive(Deserialize)]
 struct Graded {
@@ -190,6 +221,31 @@ impl Judge for CliJudge {
         labels.sort_by(|a, b| a.score().partial_cmp(&b.score()).unwrap());
         let median = labels[labels.len() / 2];
         Ok(Verdict { label: median, feedback })
+    }
+
+    fn divergence(
+        &self,
+        question: &str,
+        prediction: &str,
+        observation: &str,
+    ) -> Result<Divergence> {
+        let system = format!(
+            "{DIVERGENCE_SYSTEM}\n\n# Reply with exactly this shape\n\n\
+             {DIVERGENCE_SHAPE}\n\n# The diff\n\n{}",
+            self.diff
+        );
+        let user = format!(
+            "# The exercise\n\n{question}\n\n# What the run was predicted to print\n\n\
+             {prediction}\n\n# What the reviewer reports it printed\n\n{observation}"
+        );
+        let (value, _) = self.cli.complete_json(&self.model, &system, &user)?;
+        let r: DivergenceReply = serde_json::from_value(value)?;
+        // A divergence with nothing said about it opens an obligation nobody can
+        // settle, so it is not a divergence.
+        Ok(Divergence {
+            diverged: r.diverged && !r.what.trim().is_empty(),
+            what: r.what,
+        })
     }
 
     fn model(&self) -> &str {

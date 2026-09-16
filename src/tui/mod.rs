@@ -200,12 +200,12 @@ impl App {
     /// upheld dispute is not a score of zero — it is not a score. Leaving it in
     /// would let the judge's own mistake block the gate, which is the thing
     /// disputing exists to undo.
-    pub fn scoreable(&self) -> Vec<f64> {
+    pub fn scoreable(&self) -> Vec<crate::gate::Scored> {
         self.questions
             .iter()
             .zip(&self.scores)
             .filter(|(q, _)| q.status != "waived" && q.status != "deferred")
-            .map(|(_, s)| *s)
+            .map(|(q, s)| crate::gate::Scored { kind: q.kind.clone(), score: *s })
             .collect()
     }
 
@@ -600,7 +600,7 @@ pub fn run(
     diff: Arc<String>,
     ai_hunks: &[git::Hunk],
     questions: Vec<db::Question>,
-) -> Result<Vec<f64>> {
+) -> Result<Vec<crate::gate::Scored>> {
     let view = build_diff_view(&diff, ai_hunks);
     let mut app = App::new(questions, view);
     app.jump_to_anchor(ai_hunks);
@@ -2155,7 +2155,12 @@ mod resume_tests {
         let qs = vec![q(1, "passed", Some(0.9)), q(2, "passed", Some(0.6))];
         let scores = App::restored_scores(&qs);
         assert_eq!(scores, vec![0.9, 0.6]);
-        assert!(crate::gate::passes(&scores));
+        let scored: Vec<crate::gate::Scored> = qs
+            .iter()
+            .zip(&scores)
+            .map(|(q, s)| crate::gate::Scored { kind: q.kind.clone(), score: *s })
+            .collect();
+        assert!(crate::gate::passes(&scored));
     }
 
     #[test]

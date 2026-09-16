@@ -28,6 +28,11 @@ pub struct Context<'a> {
     pub shadowed: Vec<String>,
     /// Test invocation, if one was found. `checkable` questions need it.
     pub test_command: Option<String>,
+    /// How the real program is started (§6.4). An `exercise` needs it and the
+    /// surfaces below; without both the kind is skipped rather than invented.
+    pub run_invocation: Option<String>,
+    /// Where each changed symbol is reachable from once the program is running.
+    pub surfaces: Vec<String>,
     /// What the change claims to be for. Without this the generator can only
     /// see individual hunks, so it can only ask about individual hunks — and a
     /// reviewer can answer every one and still not know why the PR exists.
@@ -108,8 +113,28 @@ pub struct Disputed {
     pub feedback: String,
 }
 
+/// §8 — the second pass on an `exercise`. It carries no label and cannot change
+/// the score: the reviewer reported what the program did, which is the job. What
+/// it grades is the *reading* that produced the prediction, and a divergence is
+/// the finding the whole tool exists to produce — the diff read correct and the
+/// program did not agree.
+pub struct Divergence {
+    pub diverged: bool,
+    pub what: String,
+}
+
 pub trait Judge {
     fn judge(&self, diff: &str, question: &str, answer: &str) -> Result<Verdict>;
+    /// Compare an observation against what the generator predicted the run would
+    /// print. Separate from `judge` on purpose: the prediction is the most
+    /// contaminating context there is, since an observation that echoes it is
+    /// indistinguishable from one that confirms it.
+    fn divergence(
+        &self,
+        question: &str,
+        prediction: &str,
+        observation: &str,
+    ) -> Result<Divergence>;
     /// The reference answer goes to the judge and never to the reviewer: a
     /// dispute is judged against the code, but the reference is what the claim
     /// is often about, and revealing it would turn disputing into a way to read

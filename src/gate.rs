@@ -16,6 +16,7 @@ pub struct Coverage {
     pub hunks_covered: i64,
     pub authorship: String,
     pub has_checkable: bool,
+    pub has_exercise: bool,
     pub has_intent: bool,
 }
 
@@ -34,6 +35,9 @@ impl std::fmt::Display for Coverage {
         }
         if !self.has_checkable {
             write!(f, " · no checkable")?;
+        }
+        if !self.has_exercise {
+            write!(f, " · no exercise")?;
         }
         if !self.has_intent {
             write!(f, " · NO INTENT QUESTION")?;
@@ -67,20 +71,84 @@ fn trustworthy_decline(reason: &str, ai_hunks: &[git::Hunk]) -> bool {
     llm::cites_the_diff(reason, ai_hunks)
 }
 
-fn nothing_was_answered(scores: &[f64], questions: usize) -> bool {
+/// The second pass on an `exercise`. A divergence is not a failure of the
+/// answer — the reviewer reported what the program did, which is the job. It is
+/// a failure of the reading that produced the prediction, so it opens an
+/// obligation the way an upheld `code_bug` does rather than moving the score.
+///
+/// A failed call is a note, not an error: the label is already recorded, and
+/// losing the gate over the pass that cannot change it would be the wrong trade.
+fn check_divergence(
+    conn: &Connection,
+    judge: &dyn llm::Judge,
+    q: &db::Question,
+    observation: &str,
+) -> Result<()> {
+    let d = match judge.divergence(&q.text, &q.reference, observation) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("  the divergence check failed, so nothing was recorded: {e}");
+            return Ok(());
+        }
+    };
+    if !d.diverged {
+        return Ok(());
+    }
+    println!("  the run diverged from what the diff predicted: {}", d.what);
+    println!("  recorded as an obligation — fix it, or withdraw the claim.\n");
+    db::open_obligation(conn, q.id, &format!("run diverged from the prediction: {}", d.what))
+}
+
+fn nothing_was_answered(scores: &[Scored], questions: usize) -> bool {
     scores.is_empty() && questions > 0
 }
 
-pub fn passes(scores: &[f64]) -> bool {
-    if scores.is_empty() {
+/// A score with the kind that earned it. The pass rule needs the kind because
+/// §8 exempts the `exercise` from the drop, and `scoreable()` has already
+/// dropped the questions an upheld dispute took out of the quiz — so the
+/// position in this list no longer lines up with the question list.
+#[derive(Debug, Clone)]
+pub struct Scored {
+    pub kind: String,
+    pub score: f64,
+}
+
+pub fn passes(scored: &[Scored]) -> bool {
+    if scored.is_empty() {
         return true;
     }
-    let n = scores.len();
+    // §8 — the exercise is exempt from the drop. Drop-lowest absorbs judge
+    // noise on free-text reasoning, and an observation is not that: it is a
+    // report of something that happened, checked against code rather than a
+    // rubric. The stronger reason is what forgiving it would mean — it is the
+    // only question that costs minutes and the only one answered away from this
+    // screen, so it is the first thing a hurried run skips, and a rule that can
+    // forgive it hands that skip a sanctioned route.
+    let (exercises, rest): (Vec<f64>, Vec<f64>) = scored
+        .iter()
+        .map(|s| (s.kind == "exercise", s.score))
+        .fold((Vec::new(), Vec::new()), |(mut ex, mut rest), (is_exercise, score)| {
+            if is_exercise {
+                ex.push(score);
+            } else {
+                rest.push(score);
+            }
+            (ex, rest)
+        });
+
+    if exercises.iter().any(|s| *s < 0.6) {
+        return false;
+    }
+    if rest.is_empty() {
+        return true;
+    }
+
+    let n = rest.len();
     // One question is the whole gate: there is nothing to drop and still have
     // asked anything.
     let drop = if n == 1 { 0 } else { (n / 3).max(1) };
 
-    let mut sorted = scores.to_vec();
+    let mut sorted = rest;
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     // A dropped answer is forgiven, not ignored: `wrong` on any question means
     // the quiz found something you did not know.
@@ -244,6 +312,8 @@ impl Ready {
             call_sites: context::call_sites(&dir, &ai_hunks)?,
             shadowed: context::shadowed(&dir, &ai_hunks)?,
             test_command: context::test_command(&dir),
+            run_invocation: context::run_invocation(&dir),
+            surfaces: context::surfaces(&dir, &ai_hunks)?,
             pr_title: pr.title.clone(),
             commit_subjects: gh::pr_commits(&dir, pr.number).unwrap_or_default(),
             all_files: git::changed_files(&dir, &base_sha, &head_sha)?,
@@ -251,6 +321,17 @@ impl Ready {
         };
         if ctx.test_command.is_none() {
             eprintln!("note: no test command found — no checkable question is possible");
+        }
+        // §7 — an exercise needs both halves: something to run, and somewhere to
+        // look once it is running. Naming the missing half is the difference
+        // between a repository that has no surface and a detector that missed it.
+        if ctx.run_invocation.is_none() || ctx.surfaces.is_empty() {
+            let missing = match (ctx.run_invocation.is_none(), ctx.surfaces.is_empty()) {
+                (true, true) => "no run invocation and no reachable surface",
+                (true, false) => "no run invocation",
+                _ => "no reachable surface",
+            };
+            eprintln!("note: {missing} — no exercise question is possible");
         }
 
         let generator: Box<dyn llm::Generator> = match self.backend() {
@@ -293,11 +374,12 @@ impl Ready {
 
         let covered: HashSet<&str> = generated.iter().map(|g| g.anchor.as_str()).collect();
         let has_checkable = generated.iter().any(|g| g.kind == "checkable");
+        let has_exercise = generated.iter().any(|g| g.kind == "exercise");
         let has_intent = generated.iter().any(|g| g.kind == "intent");
         if !has_intent {
             eprintln!("warning: the generator returned no intent question");
         }
-        db::set_gate_coverage(&conn, gate_id, covered.len() as i64, has_checkable)?;
+        db::set_gate_coverage(&conn, gate_id, covered.len() as i64, has_checkable, has_exercise)?;
 
         let coverage = Coverage {
             questions: generated.len(),
@@ -306,6 +388,7 @@ impl Ready {
             hunks_covered: covered.len() as i64,
             authorship: scope.mode.as_str().to_string(),
             has_checkable,
+            has_exercise,
             has_intent,
         };
         println!("\n{coverage}\n");
@@ -419,6 +502,7 @@ impl Ready {
             hunks_covered: gate.hunks_covered,
             authorship: gate.authorship.clone(),
             has_checkable: gate.has_checkable,
+            has_exercise: gate.has_exercise,
             has_intent: questions.iter().any(|q| q.kind == "intent"),
         };
 
@@ -462,7 +546,7 @@ impl Ready {
         ai_hunks: &[git::Hunk],
         questions: Vec<db::Question>,
         restatement_sources: Vec<String>,
-    ) -> Result<Vec<f64>> {
+    ) -> Result<Vec<Scored>> {
         let done = questions.iter().filter(|q| q.status == "passed").count();
         if done > 0 {
             println!("{done} of {} already passed — resuming.", questions.len());
@@ -501,13 +585,14 @@ impl Ready {
             let restored = tui::App::restored_scores(&questions);
             let mut scores = Vec::new();
             for (i, q) in questions.iter().enumerate() {
-                match q.status.as_str() {
-                    "passed" => scores.push(restored[i]),
+                let score = match q.status.as_str() {
+                    "passed" => restored[i],
                     "waived" | "deferred" => continue,
-                    _ => scores.push(self.ask(
+                    _ => self.ask(
                         conn, judge.as_ref(), diff, ai_hunks, q, i + 1, questions.len(),
-                    )?),
-                }
+                    )?,
+                };
+                scores.push(Scored { kind: q.kind.clone(), score });
             }
             Ok(scores)
         }
@@ -556,6 +641,14 @@ impl Ready {
             judge.model(),
         )?;
         println!("  {} — {}\n", verdict.label.as_str(), verdict.feedback);
+
+        // §8 — an exercise is graded twice, and only the first pass produced a
+        // label. The second compares what the reviewer saw against what the
+        // generator predicted the run would print; it carries no label and
+        // cannot move the score.
+        if q.kind == "exercise" && score > 0.0 {
+            check_divergence(conn, judge, q, &answer)?;
+        }
         Ok(score)
     }
 
@@ -697,6 +790,7 @@ pub fn status(cwd: &Path) -> Result<()> {
                     hunks_covered: g.hunks_covered,
                     authorship: g.authorship.clone(),
                     has_checkable: g.has_checkable,
+                    has_exercise: g.has_exercise,
                     has_intent: db::questions_for(&conn, g.id)?
                         .iter()
                         .any(|q| q.kind == "intent"),
@@ -717,7 +811,124 @@ pub fn status(cwd: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::passes;
+    use super::{check_divergence, passes, Scored};
+    use crate::{db, llm};
+
+    /// A judge that reports a scripted divergence and grades nothing.
+    struct DivergingJudge {
+        what: Option<String>,
+        fails: bool,
+    }
+
+    impl llm::Judge for DivergingJudge {
+        fn judge(&self, _d: &str, _q: &str, _a: &str) -> anyhow::Result<llm::Verdict> {
+            unreachable!("the divergence pass does not grade")
+        }
+
+        fn divergence(
+            &self,
+            _q: &str,
+            _prediction: &str,
+            _observation: &str,
+        ) -> anyhow::Result<llm::Divergence> {
+            if self.fails {
+                anyhow::bail!("the model call failed");
+            }
+            Ok(llm::Divergence {
+                diverged: self.what.is_some(),
+                what: self.what.clone().unwrap_or_default(),
+            })
+        }
+
+        fn dispute(&self, _q: &str, _r: &str, _c: &str) -> anyhow::Result<llm::Disputed> {
+            unreachable!("the divergence pass does not dispute")
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// A gate with one exercise question, ready to be checked for divergence.
+    fn exercise_question() -> (rusqlite::Connection, db::Question) {
+        let p = std::env::temp_dir()
+            .join(format!("shipgate-gate-{}-{:?}.db", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_file(&p);
+        let conn = db::open_at(&p).unwrap();
+        let gate = db::upsert_gate(
+            &conn,
+            &db::NewGate {
+                repo: "o/r",
+                path: "/tmp/o-r",
+                pr_number: 7,
+                branch: "b",
+                base_ref: "origin/main",
+                base_sha: "a",
+                head_sha: "b",
+                diff: "d",
+                hunks_total: 1,
+                hunks_ai: 1,
+                authorship: "trailers",
+                state: "open",
+            },
+        )
+        .unwrap();
+        db::insert_questions(
+            &conn,
+            gate,
+            &[db::NewQuestion {
+                kind: "exercise",
+                file: "src/tui/quiz.rs",
+                anchor: "sha256:x",
+                text: "Run `shipgate ready` and report what the status line says.",
+                reference: "the status line reports the question was graded",
+                hints: &[],
+            }],
+        )
+        .unwrap();
+        let q = db::questions_for(&conn, gate).unwrap().remove(0);
+        (conn, q)
+    }
+
+    /// §8 — the finding the tool exists to produce: the diff read correct and
+    /// the program did not agree. It is recorded as an obligation, not as a
+    /// failed answer.
+    #[test]
+    fn a_diverging_run_opens_an_obligation() {
+        let (conn, q) = exercise_question();
+        let judge = DivergingJudge {
+            what: Some("the status line stayed empty".into()),
+            fails: false,
+        };
+        check_divergence(&conn, &judge, &q, "the status line stayed empty").unwrap();
+
+        let obligations = db::open_obligations(&conn, "o/r").unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert!(
+            obligations[0].body.contains("the status line stayed empty"),
+            "the obligation does not say what diverged: {:?}",
+            obligations[0].body
+        );
+    }
+
+    #[test]
+    fn a_matching_run_opens_nothing() {
+        let (conn, q) = exercise_question();
+        let judge = DivergingJudge { what: None, fails: false };
+        check_divergence(&conn, &judge, &q, "exactly what was predicted").unwrap();
+        assert!(db::open_obligations(&conn, "o/r").unwrap().is_empty());
+    }
+
+    /// The label is already recorded by the time this runs, so losing the gate
+    /// over the pass that cannot change the score would be the wrong trade.
+    #[test]
+    fn a_failed_divergence_check_does_not_fail_the_gate() {
+        let (conn, q) = exercise_question();
+        let judge = DivergingJudge { what: None, fails: true };
+        assert!(check_divergence(&conn, &judge, &q, "something").is_ok());
+        assert!(db::open_obligations(&conn, "o/r").unwrap().is_empty());
+    }
+
 
     const DECLINE_DIFF: &str = "\
 diff --git a/src/sync.rs b/src/sync.rs
@@ -765,6 +976,19 @@ diff --git a/src/sync.rs b/src/sync.rs
         assert!(!super::trustworthy_decline(reason, &decline_hunks()));
     }
 
+    /// Scores with no exercise among them — the ordinary case the drop rule was
+    /// written for.
+    fn graded(scores: &[f64]) -> Vec<Scored> {
+        scores
+            .iter()
+            .map(|s| Scored { kind: "prediction".into(), score: *s })
+            .collect()
+    }
+
+    fn exercise(score: f64) -> Scored {
+        Scored { kind: "exercise".into(), score }
+    }
+
     #[test]
     fn empty_passes() {
         assert!(passes(&[]));
@@ -772,24 +996,24 @@ diff --git a/src/sync.rs b/src/sync.rs
 
     #[test]
     fn single_question_has_no_drop() {
-        assert!(passes(&[0.6]));
-        assert!(!passes(&[0.3]));
+        assert!(passes(&graded(&[0.6])));
+        assert!(!passes(&graded(&[0.3])));
     }
 
     #[test]
     fn one_weak_answer_is_dropped() {
         // The v1 min rule would block this; drop-lowest does not.
-        assert!(passes(&[0.9, 0.9, 0.3]));
+        assert!(passes(&graded(&[0.9, 0.9, 0.3])));
     }
 
     #[test]
     fn two_weak_answers_block() {
-        assert!(!passes(&[0.9, 0.3, 0.3]));
+        assert!(!passes(&graded(&[0.9, 0.3, 0.3])));
     }
 
     #[test]
     fn the_dropped_one_still_has_a_floor() {
-        assert!(!passes(&[0.9, 0.9, 0.0]));
+        assert!(!passes(&graded(&[0.9, 0.9, 0.0])));
     }
 
     /// An empty score list is a pass — no questions, nothing failed — which is
@@ -799,7 +1023,43 @@ diff --git a/src/sync.rs b/src/sync.rs
     fn disputing_every_question_away_is_not_a_pass() {
         assert!(super::nothing_was_answered(&[], 3));
         assert!(!super::nothing_was_answered(&[], 0), "a trivial gate still clears");
-        assert!(!super::nothing_was_answered(&[0.9], 3));
+        assert!(!super::nothing_was_answered(&graded(&[0.9]), 3));
+    }
+
+    /// §8 — the exercise is exempt from the drop. It is the only question that
+    /// costs minutes and the only one answered away from the screen, so a rule
+    /// that could forgive it would sanction skipping it.
+    #[test]
+    fn a_failed_exercise_is_never_dropped() {
+        let mut scores = graded(&[0.9, 0.9]);
+        scores.push(exercise(0.3));
+        assert!(!passes(&scores));
+    }
+
+    /// The exemption cuts both ways: exempt from the drop, not held to a higher
+    /// bar than any other question.
+    #[test]
+    fn a_passed_exercise_clears_like_any_other_answer() {
+        let mut scores = graded(&[0.9, 0.9]);
+        scores.push(exercise(0.6));
+        assert!(passes(&scores));
+    }
+
+    /// At the floor of three with an exercise among them, one of the other two
+    /// is still forgiven — the drop applies to what is left after the exercise
+    /// is set aside.
+    #[test]
+    fn the_drop_still_forgives_one_of_the_rest() {
+        let mut scores = graded(&[0.9, 0.3]);
+        scores.push(exercise(0.9));
+        assert!(passes(&scores));
+    }
+
+    /// A gate whose only question was an exercise has nothing left to drop.
+    #[test]
+    fn an_exercise_alone_decides_the_gate() {
+        assert!(passes(&[exercise(0.6)]));
+        assert!(!passes(&[exercise(0.3)]));
     }
 
     /// §7 scaled the question count; a fixed drop would have scaled the bar
@@ -807,33 +1067,33 @@ diff --git a/src/sync.rs b/src/sync.rs
     /// three questions forgiving one is.
     #[test]
     fn the_share_forgiven_holds_as_the_count_grows() {
-        assert!(passes(&[0.9, 0.9, 0.9, 0.9, 0.3, 0.3]));
-        assert!(!passes(&[0.9, 0.9, 0.9, 0.3, 0.3, 0.3]));
+        assert!(passes(&graded(&[0.9, 0.9, 0.9, 0.9, 0.3, 0.3])));
+        assert!(!passes(&graded(&[0.9, 0.9, 0.9, 0.3, 0.3, 0.3])));
     }
 
     /// Four and five questions still forgive one: n / 3 only reaches two at
     /// six, and rounding up would forgive half of a four-question quiz.
     #[test]
     fn four_and_five_questions_forgive_exactly_one() {
-        assert!(passes(&[0.9, 0.9, 0.9, 0.3]));
-        assert!(!passes(&[0.9, 0.9, 0.3, 0.3]));
-        assert!(passes(&[0.9, 0.9, 0.9, 0.9, 0.3]));
-        assert!(!passes(&[0.9, 0.9, 0.9, 0.3, 0.3]));
+        assert!(passes(&graded(&[0.9, 0.9, 0.9, 0.3])));
+        assert!(!passes(&graded(&[0.9, 0.9, 0.3, 0.3])));
+        assert!(passes(&graded(&[0.9, 0.9, 0.9, 0.9, 0.3])));
+        assert!(!passes(&graded(&[0.9, 0.9, 0.9, 0.3, 0.3])));
     }
 
     /// Forgiven is not ignored. A `wrong` answer means the quiz found something
     /// you did not know, at any count.
     #[test]
     fn a_wrong_answer_blocks_however_many_are_dropped() {
-        assert!(!passes(&[0.9, 0.9, 0.9, 0.9, 0.3, 0.0]));
+        assert!(!passes(&graded(&[0.9, 0.9, 0.9, 0.9, 0.3, 0.0])));
     }
 
     /// The §7 floor is three, but a gate can still hold fewer: an earlier run
     /// may have left one question, and the rule must not change under it.
     #[test]
     fn the_small_cases_are_unchanged() {
-        assert!(passes(&[0.9, 0.3]));
-        assert!(!passes(&[0.9, 0.0]));
-        assert!(!passes(&[0.3, 0.3]));
+        assert!(passes(&graded(&[0.9, 0.3])));
+        assert!(!passes(&graded(&[0.9, 0.0])));
+        assert!(!passes(&graded(&[0.3, 0.3])));
     }
 }

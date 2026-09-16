@@ -34,6 +34,15 @@ Never ask 'what does this PR do' or 'summarise this change'.
 The remaining questions come from, in this order:
   checkable — the reviewer obtains the answer by RUNNING something. Use only a \
     command given to you in the context. If none was given, do not use this kind.
+  exercise — NOT a question: an instruction to start the real program the way a \
+    user starts it, reach the changed behaviour through the surface it sits \
+    behind, and report what happened. Use ONLY where both a run invocation and \
+    a surface appear in the context, and at most one per gate. Name the \
+    invocation verbatim and say which surface to drive. Its reference is what \
+    you predict the run will PRINT, not what the reviewer is supposed to say — \
+    the observation they paste back can falsify it, and that is the point. \
+    Never use a test command here: the suite is what gets run instead of the \
+    program, which is the habit this kind exists to break.
   prediction — 'if X were Y, what does the caller at this line observe'.
   adversarial — 'what input breaks this'.
   cross_cutting — 'what at <this call site> assumes this'. Use ONLY where a call \
@@ -86,7 +95,7 @@ const SHAPE: &str = r#"{
   "reason": "",
   "questions": [
     {
-      "kind": "intent | checkable | prediction | adversarial | cross_cutting | shadowed | justification",
+      "kind": "intent | checkable | exercise | prediction | adversarial | cross_cutting | shadowed | justification",
       "file": "path/to/file",
       "anchor": "the anchor string copied verbatim from the hunk",
       "text": "the question",
@@ -112,11 +121,35 @@ fn system_prompt(min: usize, max: usize) -> String {
 /// kept, since only the generator can tell a missing question from a padded one
 /// and it was told to prefer the former.
 fn fit(mut questions: Vec<Question>, min: usize, max: usize) -> Vec<Question> {
+    // At most one exercise per gate: it is the only question that costs minutes
+    // rather than a paragraph, and two of them is the quiz becoming the thing
+    // the reviewer routes around.
+    let mut seen_exercise = false;
+    questions.retain(|q| {
+        if q.kind != "exercise" {
+            return true;
+        }
+        let first = !seen_exercise;
+        seen_exercise = true;
+        if !first {
+            eprintln!("  generator returned a second exercise — keeping the first");
+        }
+        first
+    });
+
     if questions.len() > max {
         // The intent question is the one no other hunk can supply, so it
         // survives truncation wherever the generator happened to put it.
         if let Some(i) = questions.iter().position(|q| q.kind == "intent") {
             questions.swap(0, i);
+        }
+        // The exercise comes out of the band rather than adding to it, which
+        // means something has to give when the generator overruns. It displaces
+        // a prediction — the kind it most overlaps — rather than falling off the
+        // end itself.
+        let second = 1.min(questions.len().saturating_sub(1));
+        if let Some(i) = questions.iter().position(|q| q.kind == "exercise") {
+            questions.swap(second, i);
         }
         eprintln!(
             "  generator returned {} questions for a ceiling of {max} — keeping {max}",
@@ -174,6 +207,19 @@ impl Generator for CliGenerator {
             );
         } else {
             user.push_str(&format!("# Call sites\n\n{}\n\n", ctx.call_sites.join("\n")));
+        }
+
+        match (&ctx.run_invocation, ctx.surfaces.is_empty()) {
+            (Some(cmd), false) => user.push_str(&format!(
+                "# How this program is run, and what the change sits behind\n\n                 The program is started with `{cmd}`. Each block below is a \
+                 changed symbol and the surfaces it is reachable through once it \
+                 is running. An exercise question may send the reviewer there.\n\n{}\n\n",
+                ctx.surfaces.join("\n")
+            )),
+            _ => user.push_str(
+                "# How this program is run, and what the change sits behind\n\nNot \
+                 found. Do not use the exercise kind.\n\n",
+            ),
         }
 
         if ctx.shadowed.is_empty() {
@@ -267,6 +313,54 @@ mod tests {
             "the kind is not tied to the context that makes it answerable"
         );
         assert!(p.contains("| shadowed |"), "the kind is missing from the schema");
+    }
+
+    /// Like `shadowed`, the kind is worse than useless on invented context: a
+    /// fabricated exercise costs minutes before it is found to be nonsense.
+    #[test]
+    fn the_prompt_ties_the_exercise_kind_to_its_context() {
+        let p = system_prompt(3, 6);
+        assert!(p.contains("exercise"), "the kind is missing from the prompt");
+        assert!(
+            p.contains("Use ONLY where both a run invocation and \
+    a surface appear in the context"),
+            "the kind is not tied to the context that makes it answerable"
+        );
+        assert!(p.contains("| exercise |"), "the kind is missing from the schema");
+    }
+
+    /// §7: the reference is what the run is predicted to print, so the
+    /// observation can falsify it. A prompt that asks for an answer key instead
+    /// loses the only signal the kind exists to produce.
+    #[test]
+    fn the_prompt_asks_the_exercise_reference_as_a_prediction() {
+        let p = system_prompt(3, 6);
+        assert!(
+            p.contains("what you predict the run will PRINT"),
+            "the reference is not asked for as a prediction"
+        );
+    }
+
+    /// It costs minutes where the others cost a paragraph.
+    #[test]
+    fn only_one_exercise_survives() {
+        let out = fit(vec![q("intent"), q("exercise"), q("exercise"), q("prediction")], 3, 6);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.iter().filter(|q| q.kind == "exercise").count(), 1);
+    }
+
+    /// It comes out of the band rather than adding to it, so on an overrun it
+    /// displaces a prediction rather than falling off the end itself.
+    #[test]
+    fn trimming_keeps_the_exercise_over_a_prediction() {
+        let out = fit(
+            vec![q("prediction"), q("adversarial"), q("exercise"), q("intent")],
+            3,
+            2,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].kind, "intent");
+        assert_eq!(out[1].kind, "exercise");
     }
 
     #[test]
