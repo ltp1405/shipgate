@@ -1169,6 +1169,7 @@ pub fn run_headless(
     struct Scripted {
         keys: std::vec::IntoIter<event::KeyEvent>,
         polls: usize,
+        quits: usize,
         wait_for_grading: bool,
     }
 
@@ -1184,19 +1185,41 @@ pub fn run_headless(
                 std::thread::sleep(Duration::from_millis(1));
                 return Ok(None);
             }
-            self.polls = 0;
             match self.keys.next() {
-                Some(k) => Ok(Some(k)),
+                Some(k) => {
+                    self.polls = 0;
+                    self.quits = 0;
+                    Ok(Some(k))
+                }
                 // Out of keys. If something is still in flight, hold for it so
                 // the verdict lands before the loop stops.
                 None if app.in_flight() > 0 => {
+                    self.polls += 1;
+                    if self.polls > 20_000 {
+                        anyhow::bail!("a scripted judge call never returned");
+                    }
                     std::thread::sleep(Duration::from_millis(1));
                     Ok(None)
                 }
-                None => Ok(Some(event::KeyEvent::new(
-                    KeyCode::Char('q'),
-                    KeyModifiers::NONE,
-                ))),
+                // The synthetic quit ends the loop, so the loop asking for
+                // another one means the quit was swallowed. Fail the test
+                // instead of spinning: an uncapped loop here burns a core and
+                // grows the query string until the machine notices, which is
+                // not how a swallowed key should report itself.
+                None => {
+                    self.quits += 1;
+                    if self.quits > 100 {
+                        anyhow::bail!(
+                            "the scripted quit was swallowed {} times; the loop \
+                             never stopped",
+                            self.quits
+                        );
+                    }
+                    Ok(Some(event::KeyEvent::new(
+                        KeyCode::Char('q'),
+                        KeyModifiers::NONE,
+                    )))
+                }
             }
         }
     }
@@ -1208,7 +1231,7 @@ pub fn run_headless(
     let (tx, rx) = mpsc::channel();
     event_loop(
         &mut Editor::Headless,
-        &mut Scripted { keys: keys.into_iter(), polls: 0, wait_for_grading },
+        &mut Scripted { keys: keys.into_iter(), polls: 0, quits: 0, wait_for_grading },
         &mut app,
         conn,
         &judge,
@@ -1389,6 +1412,26 @@ diff --git a/sync.rs b/sync.rs
 
     fn plain(code: KeyCode) -> event::KeyEvent {
         event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A swallowed quit used to leave the headless loop spinning on synthetic
+    /// `q` keys, burning a core and growing the query string until someone
+    /// noticed the machine. It has to fail instead.
+    #[test]
+    fn a_swallowed_quit_fails_the_test_rather_than_spinning() {
+        let (conn, hunks, questions) = fixture(1);
+        let err = run_headless(
+            &conn,
+            Arc::new(llm::stub::StubJudge::scripted([])),
+            Arc::new(DIFF.to_string()),
+            &hunks,
+            questions,
+            vec![key('/'), key('a')],
+            true,
+        )
+        .err()
+        .expect("the loop returned instead of bailing");
+        assert!(err.to_string().contains("swallowed"), "got: {err}");
     }
 
     /// Ctrl-C is not query text. A prompt that eats it leaves the quiz with no
