@@ -31,7 +31,7 @@ shipgate/
 │   ├── gh.rs              # gh pr view/ready/edit/comment (JSON out)
 │   ├── authorship.rs      # Co-Authored-By trailers → set of AI-authored hunks
 │   ├── triage.rs          # does this diff deserve a quiz at all
-│   ├── context.rs         # call sites + test command, gathered from the repo
+│   ├── context.rs         # call sites + test command + run surface, from the repo
 │   ├── gate.rs            # lifecycle, pass rule, coverage
 │   ├── stats.rs           # pass rate by question kind over time
 │   ├── llm/
@@ -85,6 +85,7 @@ CREATE TABLE gates (
   hunks_covered   INTEGER NOT NULL,       -- hunks at least one question anchors to
   authorship      TEXT NOT NULL,          -- trailers | squashed | unknown
   has_checkable   INTEGER NOT NULL DEFAULT 0,
+  has_exercise    INTEGER NOT NULL DEFAULT 0,
   state           TEXT NOT NULL,          -- generating | open | cleared | trivial | failed
   last_error      TEXT,
   created_at      TEXT NOT NULL,
@@ -100,7 +101,7 @@ CREATE UNIQUE INDEX idx_gates_live
 CREATE TABLE questions (
   id          INTEGER PRIMARY KEY,
   gate_id     INTEGER NOT NULL REFERENCES gates(id) ON DELETE CASCADE,
-  kind        TEXT NOT NULL,              -- checkable | prediction | adversarial | cross_cutting | shadowed | justification
+  kind        TEXT NOT NULL,              -- checkable | exercise | prediction | adversarial | cross_cutting | shadowed | justification
   file        TEXT NOT NULL,
   anchor      TEXT NOT NULL,              -- hash of normalized hunk content, NOT a line-number header
   text        TEXT NOT NULL,
@@ -174,7 +175,7 @@ Nothing is silently capped, and nothing is silently trimmed.
 The gate records `hunks_total`, `hunks_ai` and `hunks_covered` — the number of AI hunks at least one question anchors to. Every surface prints it:
 
 ```
-feature/pc-10183 · 5 questions · 6/31 AI hunks · no checkable
+feature/pc-10183 · 5 questions · 6/31 AI hunks · no checkable · no exercise
 ```
 
 Two effects, both intended. You can see when a pass means little. And a diff that cannot be meaningfully quizzed becomes *visibly* a diff that is too large, which pushes back on the scope creep that produced it — the tool should make an unquizzable PR feel like a problem, not wave it through.
@@ -215,11 +216,12 @@ Never hardcode `origin/main`, and never assume the remote is named `origin`.
 
 ## 6. Context gathering
 
-v1 sent the diff alone. Three of the question kinds are not answerable that way:
+v1 sent the diff alone. Four of the question kinds are not answerable that way:
 
 - **cross_cutting** ("what elsewhere assumes this") — the model cannot know what elsewhere assumes anything. It invents plausible callers and a fabricated reference answer, and a wrong reference plus a correct human answer is a false block.
 - **checkable** ("obtainable by running something") — needs the test command and the fixtures, or the model invents `cargo test sync::retry`, which does not exist.
 - **shadowed** ("what this now runs in front of") — the answer is never in the hunk. What stopped happening is in the unchanged lines below the added guard, which the generator does not otherwise see.
+- **exercise** ("run it and report what happened") — needs the invocation that starts the real program and the surface the change sits behind, or the model invents both and the reviewer spends minutes finding that out.
 
 `context.rs` gathers, from static repo state only:
 
@@ -228,7 +230,8 @@ v1 sent the diff alone. Three of the question kinds are not answerable that way:
 1. **Call sites.** For each symbol whose signature or semantics changed, `git grep -n` the identifier, with ±3 lines of context. A few hundred tokens; makes `cross_cutting` real.
 2. **Test invocation.** Parsed from `Makefile` / `package.json` / `Cargo.toml` / `justfile` / `bin/rails`, plus the test files touching the changed paths. Makes `checkable` real.
 3. **What the change now runs before.** For each added line that stops or diverts flow — `return`, `continue`, `break`, `raise`, `redirect_to` — the unchanged dispatch below it, to the end of the block it sits in. Makes `shadowed` real.
-4. **Before-content** of each changed file under ~200 lines.
+4. **How the thing is run, and what the change is reachable through.** The invocation that starts the real program — `scripts.dev` / `scripts.start` in `package.json`, a `Procfile` line, `bin/dev`, a `[[bin]]` name, a `justfile` target named `run` / `dev` / `serve`, or the first shell block under a README usage heading — plus the surface each changed symbol sits behind: the route that dispatches to it, the subcommand that reaches it, the key handler that fires it. Makes `exercise` real. A test command is not a substitute: it is exactly the thing that gets run instead of the program.
+5. **Before-content** of each changed file under ~200 lines.
 
 None of it is the coding session's transcript. The generator never sees the reasoning that produced the code, so it cannot inherit its mistakes.
 
@@ -254,7 +257,7 @@ Open: the §8 pass rule is count-sensitive. Drop-lowest tolerates one bad judge 
 
 **intent** must relate at least two files or hunks. Shapes that work: what single change of intent required all these files; which of these changes could be dropped and still deliver the goal; what would you expect this to have touched that it deliberately did not; what can a caller do now that they could not before. Never "what does this PR do" or "summarise this change" — those are paraphrase, which this section exists to prevent.
 
-The remaining questions come from, in order: **checkable** (the reviewer obtains the answer by *running* something — only a command actually supplied), **prediction** ("if X were Y, what does the caller at this line observe"), **adversarial** ("what input breaks this"), **cross_cutting** ("what at the given call sites assumes this", only where a call site was supplied), **shadowed** ("name something the dispatch below this guard used to handle, and say what happens to it now", only where a guard was supplied), **justification** ("why this over the obvious alternative").
+The remaining questions come from, in order: **checkable** (the reviewer obtains the answer by *running* something — only a command actually supplied), **exercise** (drive the real surface and report what happened, only where a run invocation and a reachable surface were supplied), **prediction** ("if X were Y, what does the caller at this line observe"), **adversarial** ("what input breaks this"), **cross_cutting** ("what at the given call sites assumes this", only where a call site was supplied), **shadowed** ("name something the dispatch below this guard used to handle, and say what happens to it now", only where a guard was supplied), **justification** ("why this over the obvious alternative").
 
 Never ask what a function does. Demand a specific value, branch or call site, never "what could go wrong". For each, give a reference answer and three hints of increasing strength. Return JSON only, or `{"skip": true, "reason": "…"}`.
 
@@ -275,6 +278,25 @@ Three rules do the real work, each earned by a false positive on a live PR:
 The level read from is the outermost line the change added, not the line that returns. A `return` sits inside the `if` that decides it, so reading from the `return` stops at its own closing brace and sees nothing — which is exactly what the first working version did on the case it was built for.
 
 **At least one `checkable` per gate, where a test command exists.** This is the structural defence against the shared blind spot in §8: a question you settle by running `bin/rails runner` or `cargo test` has a ground truth outside the model. Where `context.rs` found no runnable command, or the change has no observable behaviour (pure refactor), the generator may return none — and the gate prints `no checkable` in its coverage line. Requiring one unconditionally would only make the model invent a command, which is the exact failure being defended against.
+
+**`exercise` makes you run the thing, and the reference is a prediction rather than an answer key.** It is the only kind that is not a question. It is an instruction — start the program the way a user starts it, reach the changed behaviour through the surface it actually sits behind, and report what happened — and the observation you paste back is the answer:
+
+```
+exercise · src/tui/quiz.rs
+  Run `shipgate ready` on this branch. Submit an answer, then press tab
+  before the verdict lands. Report what the status line says, and what
+  the moved-past question's score shows once the verdict arrives.
+```
+
+`checkable` does not cover this, and the difference is the whole point. A test command is the thing that gets run *instead of* the program: it exercises the unit under a harness that supplies its own inputs, and it is where a change can be green while the surface it ships behind was never opened once. The habit this exists to break is shipping on a passing suite alone, so the kind that breaks it has to leave the suite.
+
+Three rules, mirroring the ones the other context-dependent kinds needed:
+
+- **Skipped where §6 found no run invocation, or no surface the change is reachable through.** Without both, the model invents a way to start the program and a place to look, and a fabricated exercise is worse than a fabricated question — it costs minutes before it is discovered to be nonsense. Migration-only and pure-internals changes legitimately have no surface; the coverage line says `no exercise`.
+- **At most one per gate, and it comes out of the band rather than adding to it** — §7's ceiling is 6 because the quiz competes with reviewing the PR, and this one costs minutes where the others cost a paragraph. It displaces a `prediction`, which is the kind it most overlaps: both ask what the code does at a point the reviewer has not looked at.
+- **The reference is what the generator predicts the run will print**, not what the reviewer is supposed to say. That inverts the usual direction: the observation can falsify the reference. A divergence means either the reviewer did not run it, or the code does not do what a careful reader of the diff concluded it does — and the second is worth more than any passed question on the gate. §8 routes it accordingly.
+
+Fabricated observations are not defended against beyond §8's existing precheck, which here requires a literal token from the run — a path, an identifier, a printed number. §0 already concedes the override key; inventing what you saw is the override with extra steps, and anti-cheat machinery would cost real complexity to deter only the person it is built for.
 
 ```json
 [
@@ -303,6 +325,10 @@ This is a mitigation, not a fix. The real defence is `checkable` questions, whos
 
 **The reference answer is not sent to the judge.** v1 supplied it while instructing the model to grade against the code because the reference "may be wrong". That does not work — the model regresses toward reference-similarity regardless of the instruction, and the only reliable fix is removing the anchor from the context. The stored reference is used for the post-pass reveal and hint tier 2, nothing else.
 
+**An `exercise` is graded in two passes, and only the first produces a label.** The observation is judged against the code exactly like any other answer, with the reference withheld for the reason above — the prediction is the most contaminating context there is, since an observation that echoes it is indistinguishable from one that confirms it. A second, separate call then compares the observation against the prediction and returns `{"diverged": true|false, "what": "…"}` only. It carries no label and cannot change the score.
+
+A divergence opens an `obligations` row the same way an upheld `code_bug` does, and settles the same way: fix it, or withdraw the claim. It is not a failure of the answer — the reviewer reported what the program did, which is the job. It is a failure of the reading that produced the prediction, and the one the gate most wants recorded, since the whole tool exists to find the places where the diff reads correct and the program does not agree.
+
 **Discrete labels, not a continuous score.** The judge returns its own answer first, so reasoning precedes grade:
 
 ```json
@@ -322,6 +348,8 @@ This is a mitigation, not a fix. The real defence is `checkable` questions, whos
 v1 required every question ≥ 0.7. If per-question judging misfires on a good answer 10% of the time, that blocks a legitimate PR 27% of the time at three questions and 41% at five; a tolerable 10% gate-level false-block rate under min would need a 2% per-question false-fail rate, which no free-text judge delivers. Dropping the lowest keeps the intent — you cannot ace two and whiff the one that matters — at roughly 92% under the same noise at five questions.
 
 **The share forgiven is fixed, not the count.** §7 made the question count a function of the diff, and a fixed drop-one rule would have made the gate strictness a function of it too: one of three forgiven is two thirds required, one of six is five sixths. Under the same 10% noise that is a 2.8% false-block rate at three questions and 11.4% at six — the wider band would have silently punished the larger PRs it exists to cover. `n / 3` keeps the requirement at two thirds wherever the band lands (1.6% at six, where the extra evidence earns the extra latitude), and leaves three, four and five questions forgiving exactly one as before.
+
+**An `exercise` is exempt from the drop.** Drop-lowest exists to absorb judge noise on free-text reasoning, and an observation is the one answer on the gate that is not that — it is a report of something that happened, checked against code rather than against a rubric, so the noise the rule compensates for is largely not present. The stronger reason is what forgiving it would mean: the exercise is the only question that costs minutes and the only one that leaves the terminal, so it is the first thing a hurried run would skip, and a rule that can forgive it hands that skip a sanctioned route. The drop applies to the remaining `n / 3`; where the band is at its floor of three, that still forgives one of the other two.
 
 **Dispute mode.** You claim the question's premise, or the code itself, is wrong.
 
@@ -377,7 +405,7 @@ Upheld `code_bug` findings stay an open obligation in the database and are liste
 ```
 $ shipgate status
 owner/repo#41   ready 2d ago   no gate
-owner/repo#44   cleared        5 questions · 6/31 AI hunks · no checkable
+owner/repo#44   cleared        5 questions · 6/31 AI hunks · no checkable · no exercise
 owner/repo#44   obligation     "drop_path frees twice on early return"
 ```
 
@@ -389,6 +417,7 @@ It lists PRs that went ready without a gate — the GitHub web UI's "Ready for r
 $ shipgate stats --since 90d
 kind            asked  passed  first-try  hints
 checkable          22     21       82%      0.4
+exercise            9      6       67%      0.2
 prediction         31     19       48%      1.7
 adversarial        24     20       71%      0.9
 cross_cutting      18      9       41%      2.1
@@ -396,7 +425,10 @@ shadowed           11      4       36%      1.4
 justification      14     13       88%      0.3
 
 disputes: 11 raised, 3 upheld (27%)
+exercises: 9 run, 2 predictions diverged · 14 gates had no run surface
 ```
+
+The `exercise` line answers a question none of the others can: `9 run` against `14 gates had no run surface` is the share of your work that shipped without anyone watching it work, and it is a property of the repositories rather than of you. A codebase where the number stays high is one where the suite is the only witness — which is the gap the kind was added for, and the only place the tool can say so.
 
 The point is the low rows. `prediction`, `cross_cutting` and `shadowed` failing consistently is not a scoring artefact — it says which *category* of AI work you routinely accept without understanding: consequences at the call site, effects on code outside the diff, and behaviour that a new branch quietly stopped reaching. That is the finding the whole tool exists to produce, and it only appears in aggregate.
 
@@ -408,6 +440,8 @@ One screen, two panes. `?` for keys.
 
 - **Left: the diff**, scrollable, syntax-highlighted, jumped to the question's anchor, with AI-authored hunks marked. Not a later addition — an open-book quiz without the book is a memory test on code you wrote last week.
 - **Right: the question**, hints revealed so far, and your answer.
+
+**The exercise expects you to leave.** It is the one question answered somewhere other than this screen, so quitting with it open has to be a normal path rather than a lost run. That costs more than replay already gives: `shipgate ready` restores the stored gate (§2), but the hints taken and the drafts on the other questions live on the app, so an exercise that sends you away throws them out. They move to the database, written on change rather than on submit. Its pane shows the invocation on its own line so it can be copied out, and the answer buffer is the observation.
 
 Keys: `e` opens `$EDITOR` on the answer buffer, `h` next hint, `d` dispute, `Enter` submit, `j`/`k` scroll the diff.
 
