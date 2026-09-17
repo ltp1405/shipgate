@@ -10,8 +10,15 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// A judge call is one uninterrupted `claude -p` turn: no tools, text in, text
+/// out. Real calls run 10-60s depending on diff size; this leaves a wide
+/// margin while still failing a hung subprocess within one grading cycle
+/// instead of leaving the quiz on "grading…" forever.
+const JUDGE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Deserialize)]
 struct CliResult {
@@ -62,16 +69,48 @@ impl Cli {
             .context("no stdin on the claude process")?
             .write_all(user.as_bytes())?;
 
-        let out = child.wait_with_output()?;
-        if !out.status.success() {
+        // Drain stdout/stderr on their own threads so a full pipe buffer can't
+        // deadlock the poll loop below, then wait with a deadline instead of
+        // `wait_with_output`'s unbounded block — a hung `claude` process must
+        // fail the call, not the thread grading it runs on.
+        let mut stdout = child.stdout.take().context("no stdout on the claude process")?;
+        let mut stderr = child.stderr.take().context("no stderr on the claude process")?;
+        let stdout_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        });
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        });
+
+        let deadline = Instant::now() + JUDGE_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("claude did not respond within {JUDGE_TIMEOUT:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        let stdout_buf = stdout_handle.join().unwrap_or_default();
+        let stderr_buf = stderr_handle.join().unwrap_or_default();
+
+        if !status.success() {
             bail!(
                 "claude exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
+                status,
+                String::from_utf8_lossy(&stderr_buf).trim()
             );
         }
 
-        let parsed: CliResult = serde_json::from_slice(&out.stdout)
+        let parsed: CliResult = serde_json::from_slice(&stdout_buf)
             .context("could not parse the claude --output-format json envelope")?;
         if parsed.is_error {
             bail!("claude reported an error: {}", parsed.result);
